@@ -2,9 +2,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import logging
 import mcubes
-from icecream import ic
+
+def find_surface_points(sdf_all, t_all):
+    # sdf_all and t_all: [batch_size, N_rays, N_samples + N_importance]
+    sdf_bool_0 = sdf_all[..., :-1] * sdf_all[..., 1:] < 0.0
+    sdf_bool_1 = sdf_all[..., :-1] > sdf_all[..., 1:]
+
+    sdf_bool = sdf_bool_0 & sdf_bool_1
+
+    # [Batch_size, N_rays]
+    max, max_indices = torch.max(sdf_bool, dim=-1)
+    network_mask = max > 0
+    d_surface = torch.zeros_like(network_mask, device = 'cuda').float()
+
+    sdf_0 = torch.gather(sdf_all[network_mask], dim=1, index=max_indices[network_mask].unsqueeze(-1)).squeeze(-1)
+    sdf_1 = torch.gather(sdf_all[network_mask], dim=1, index=(max_indices[network_mask] + 1).unsqueeze(-1)).squeeze(-1)
+    t_0 = torch.gather(t_all[network_mask], dim=1, index=max_indices[network_mask].unsqueeze(-1)).squeeze(-1)
+    t_1 = torch.gather(t_all[network_mask], dim=1, index=(max_indices[network_mask] + 1).unsqueeze(-1)).squeeze(-1)
+
+    d_surface[network_mask] = (sdf_0 * t_1 - sdf_1 * t_0) / (sdf_0 - sdf_1)
+
+    return d_surface, network_mask
 
 
 def extract_fields(bound_min, bound_max, resolution, query_func):
@@ -25,9 +44,11 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
     return u
 
 
-def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
+def extract_geometry(bound_min, bound_max, resolution, threshold, query_func, save_numpy_sdf=False):
     print('threshold: {}'.format(threshold))
     u = extract_fields(bound_min, bound_max, resolution, query_func)
+    if save_numpy_sdf:
+        np.save("/home/ojaswa/aarya/research_papers_implementation/NeuS/sdf_volume_grid.npy", u)
     vertices, triangles = mcubes.marching_cubes(u, threshold)
     b_max_np = bound_max.detach().cpu().numpy()
     b_min_np = bound_min.detach().cpu().numpy()
@@ -222,7 +243,13 @@ class NeuSRenderer:
         feature_vector = sdf_nn_output[:, 1:]
 
         gradients = sdf_network.gradient(pts).squeeze()
-        sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
+
+        #TODO: comment this out
+        # generate random gradients
+        gradients_randn = torch.randn_like(gradients)
+
+        # sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
+        sampled_color = color_network(pts, gradients_randn, dirs, feature_vector).reshape(batch_size, n_samples, 3)
 
         inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
@@ -270,6 +297,34 @@ class NeuSRenderer:
                                             dim=-1) - 1.0) ** 2
         gradient_error = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
 
+        max, max_indices = torch.max(weights, dim=-1)
+        network_mask = max_indices < n_samples
+        
+        gradients_surface = torch.gather(gradients.reshape(batch_size, n_samples, 3)[network_mask], dim=1, index=max_indices[network_mask].view(-1, 1, 1).expand(-1, 1, 3)).squeeze(1)
+
+        # sdf_all = sdf.reshape(batch_size, n_samples).unsqueeze(0)
+        # t_all = mid_z_vals.reshape(batch_size, n_samples).unsqueeze(0)
+
+        # [Batch_size, N_rays]
+        # d_surface, network_mask = find_surface_points(sdf_all, t_all)
+
+        # #[N_rays]
+        # d_surface = d_surface.squeeze(0)
+        # network_mask = network_mask.squeeze(0)
+
+        # #[N_rays, 3] = [N_rays,3] +[N_rays, 3] * [N_rays, 1]
+        # point_surface = rays_o + rays_d * d_surface[:,None]
+
+        # #[N_masked_rays, 3]
+        # point_surface_wmask = point_surface[network_mask]
+
+        #surface_points gradients
+        # [N_masked_rays, 3]
+        # gradients_surface = sdf_network.gradient(point_surface_wmask).squeeze()
+
+        # normalize the gradients
+        gradients_surface = gradients_surface / torch.linalg.norm(gradients_surface, ord=2, dim=-1, keepdim=True)
+
         return {
             'color': color,
             'sdf': sdf,
@@ -280,7 +335,9 @@ class NeuSRenderer:
             'weights': weights,
             'cdf': c.reshape(batch_size, n_samples),
             'gradient_error': gradient_error,
-            'inside_sphere': inside_sphere
+            'inside_sphere': inside_sphere,
+            'network_mask': network_mask,
+            'surface_points_gradients': gradients_surface,
         }
 
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
@@ -360,6 +417,8 @@ class NeuSRenderer:
                                     cos_anneal_ratio=cos_anneal_ratio)
 
         color_fine = ret_fine['color']
+        surface_points_gradients = ret_fine['surface_points_gradients']
+        network_mask = ret_fine['network_mask']
         weights = ret_fine['weights']
         weights_sum = weights.sum(dim=-1, keepdim=True)
         gradients = ret_fine['gradients']
@@ -374,12 +433,15 @@ class NeuSRenderer:
             'gradients': gradients,
             'weights': weights,
             'gradient_error': ret_fine['gradient_error'],
-            'inside_sphere': ret_fine['inside_sphere']
+            'inside_sphere': ret_fine['inside_sphere'],
+            'surface_points_gradients': surface_points_gradients,
+            'network_mask': network_mask,
         }
 
-    def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):
+    def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0, save_numpy_sdf=False):
         return extract_geometry(bound_min,
                                 bound_max,
                                 resolution=resolution,
                                 threshold=threshold,
-                                query_func=lambda pts: -self.sdf_network.sdf(pts))
+                                query_func=lambda pts: -self.sdf_network.sdf(pts),
+                                save_numpy_sdf=save_numpy_sdf)

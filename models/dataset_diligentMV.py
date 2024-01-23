@@ -2,11 +2,14 @@ import torch
 import torch.nn.functional as F
 import cv2 as cv
 import numpy as np
-import os
+from scipy.io import loadmat
+import os, json
 from glob import glob
 from icecream import ic
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
+
+from utils.camera_normalization import normalize_camera
 
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
@@ -33,6 +36,15 @@ def load_K_Rt_from_P(filename, P=None):
 
     return intrinsics, pose
 
+def generate_random_mask(n_images, height, width):
+    # Generate random values between 0 and 1
+    random_values = torch.rand(n_images, height, width, 3)
+
+    # Threshold the values to create a binary mask
+    threshold = 0.5
+    mask = (random_values > threshold).float()
+
+    return mask
 
 class Dataset:
     def __init__(self, conf):
@@ -42,53 +54,112 @@ class Dataset:
         self.conf = conf
 
         self.data_dir = conf.get_string('data_dir')
-        self.render_cameras_name = conf.get_string('render_cameras_name')
-        self.object_cameras_name = conf.get_string('object_cameras_name')
+        self.image_dir = conf.get_string('image_dir')
+        self.mask_dir = conf.get_string('mask_dir')
+        self.render_cameras_name = conf.get_string('camera_params')
+        self.image_num = conf.get_string('image_num')
+        self.image_num = "00" + self.image_num if len(self.image_num) == 1 else "0" + self.image_num
 
-        self.camera_outside_sphere = conf.get_bool('camera_outside_sphere', default=True)
-        self.scale_mat_scale = conf.get_float('scale_mat_scale', default=1.1)
+        directories = [d for d in os.listdir(self.image_dir) if os.path.isdir(os.path.join(self.image_dir, d))]
 
-        camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
-        self.camera_dict = camera_dict
-        self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
-        self.n_images = len(self.images_lis)
-        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
-        self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
-        self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
+        self.images_list = []
+        # Iterate through each directory
+        for directory in directories:
+            # Construct the full path to the current directory
+            current_directory = os.path.join(self.image_dir, directory)
+            if os.path.isfile(os.path.join(current_directory, self.image_num + '.png')):
+                self.images_list.append(os.path.join(current_directory, self.image_num + '.png'))
 
-        # world_mat is a projection matrix from world to image
-        self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
-
-        self.scale_mats_np = []
-
-        # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
-        self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+        self.n_images = len(self.images_list)
+        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_list]) / 255.0
+        self.masks_lis = sorted(glob(os.path.join(self.mask_dir, '*.png')))
+        self.masks = generate_random_mask(self.n_images, self.images_np.shape[1], self.images_np.shape[2])
 
         self.intrinsics_all = []
         self.pose_all = []
+        rotation_list, trans_list = [], []
 
-        for scale_mat, world_mat in zip(self.scale_mats_np, self.world_mats_np):
-            P = world_mat @ scale_mat
-            P = P[:3, :4]
-            intrinsics, pose = load_K_Rt_from_P(None, P)
-            self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
-            self.pose_all.append(torch.from_numpy(pose).float())
+        self.W2C_list = []
+        self.C2W_list = []
+        self.P_list = []
+        # unique_camera_center_list = []
+        self.camera_center_all_view = []
 
+        camera_calib_dict = loadmat(os.path.join(self.data_dir, self.render_cameras_name))
+
+        self.K = np.asarray(camera_calib_dict['KK'])
+
+        self.K = self.K / self.K[2, 2]
+        intrinsics = np.eye(4)
+        intrinsics[:3, :3] = self.K
+
+        for i in range(self.n_images):
+            rotation = camera_calib_dict[f'Rc_{i + 1}']
+            trans = camera_calib_dict[f'Tc_{i + 1}']
+
+            # pose_W2C = np.zeros(4, dtype=np.float32)
+
+            rotation_list.append(rotation)
+            trans_list.append(trans)
+
+            # pose_W2C[:3, :3] = rotation
+            # pose_W2C[:3, 3] = trans[:, 0]
+
+            # pose_W2C[-1, -1] = 1.0
+
+            # self.pose_all.append(pose_W2C)
+
+        # self.normalized_coordinate_center, self.normalized_coordinate_scale = normalize_camera(rotation_list, trans_list)
+
+        for view_idx in range(1, 21):
+            R = camera_calib_dict[f"Rc_{view_idx}"]
+            t = camera_calib_dict[f"Tc_{view_idx}"]
+
+            W2C = np.zeros((4, 4), float)
+            W2C[:3, :3] = R
+            W2C[:3, 3] = np.squeeze(t)
+            W2C[-1, -1] = 1
+            self.W2C_list.append(W2C)
+
+            C2W = np.linalg.inv(W2C)
+            self.C2W_list.append(C2W)
+
+            # W2C_scaled = np.zeros((4, 4), float)
+            # W2C_scaled[:3, :3] = self.normalized_coordinate_scale * R
+            # W2C_scaled[:3, 3] = np.squeeze(t) + R @ self.normalized_coordinate_center
+            # W2C_scaled[-1, -1] = 1
+            # P = intrinsics[:3, :3] @ W2C_scaled[
+            #                      :3]  # shape: (3, 4), project a 3D point in the world coordinate onto the pixel coordinate
+            # self.P_list.append(P)
+
+            # camera_center = - R.T @ t  # in world coordinate
+            # shift then scale
+            # camera_center_scaled = (camera_center - self.normalized_coordinate_center[:,
+            #                                         None]) / self.normalized_coordinate_scale
+            
+            # unique_camera_center_list.append(camera_center_scaled)
+            # unique_camera_center_list.append(camera_center)
+
+        self.intrinsics_all = np.tile(intrinsics, (self.n_images, 1)).reshape(self.n_images, intrinsics.shape[0], intrinsics.shape[1])
+        self.pose_all = np.asarray(self.C2W_list)
         self.images = torch.from_numpy(self.images_np.astype(np.float32)).to(self.device)  # [n_images, H, W, 3]
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).to(self.device)   # [n_images, H, W, 3]
-        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
+        self.H, self.W = self.images.shape[1], self.images.shape[2]
+
+        self.intrinsics_all = torch.from_numpy(self.intrinsics_all).float().to(self.device)   # [n_images, 4, 4]
         self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
         self.focal = self.intrinsics_all[0][0, 0]
-        self.pose_all = torch.stack(self.pose_all).to(self.device)  # [n_images, 4, 4]
-        self.H, self.W = self.images.shape[1], self.images.shape[2]
-        self.image_pixels = self.H * self.W
+        self.pose_all = torch.from_numpy(self.pose_all).float().to(self.device)  # [n_images, 4, 4]
+
+        # self.unique_camera_centers = torch.from_numpy(
+        #     np.squeeze(np.array(unique_camera_center_list))).float().to(self.device)  # (num_cams, 3)
+        # self.projection_matrices = torch.from_numpy(np.array(self.P_list)).float().to(self.device)  # (num_cams, 3, 4)
 
         object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
         object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
         # Object scale mat: region of interest to **extract mesh**
-        object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
-        object_bbox_min = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_min[:, None]
-        object_bbox_max = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_max[:, None]
+        object_scale_mat = np.eye(4)
+        object_bbox_min = np.linalg.inv(object_scale_mat) @ object_scale_mat @ object_bbox_min[:, None]
+        object_bbox_max = np.linalg.inv(object_scale_mat) @ object_scale_mat @ object_bbox_max[:, None]
         self.object_bbox_min = object_bbox_min[:3, 0]
         self.object_bbox_max = object_bbox_max[:3, 0]
 
@@ -107,6 +178,7 @@ class Dataset:
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
         rays_o = self.pose_all[img_idx, None, None, :3, 3].expand(rays_v.shape)  # W, H, 3
+        # rays_o = self.unique_camera_centers[img_idx, None, :3].expand(rays_v.shape) # batch_size, 3
         return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
 
     def gen_random_rays_at(self, img_idx, batch_size):
@@ -123,6 +195,7 @@ class Dataset:
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
+        # rays_o = self.unique_camera_centers[img_idx, None, :3].expand(rays_v.shape) # batch_size, 3
         return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), mask[:, :1].cpu()], dim=-1).cuda()    # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
@@ -167,6 +240,6 @@ class Dataset:
         return near, far
 
     def image_at(self, idx, resolution_level):
-        img = cv.imread(self.images_lis[idx])
+        img = cv.imread(self.images_list[idx])
         return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
 

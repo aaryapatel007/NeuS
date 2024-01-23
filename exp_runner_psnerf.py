@@ -1,5 +1,4 @@
 import os
-import time
 import logging
 import argparse
 import numpy as np
@@ -9,12 +8,13 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from shutil import copyfile
-from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
-from models.dataset import Dataset
+# from models.dataset_diligent import Dataset
+# from models.dataset_diligentMV import Dataset
+from models.dataset_psnerf import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
-from models.renderer import NeuSRenderer
+from models.renderer_diligent import NeuSRenderer
 
 
 class Runner:
@@ -101,10 +101,11 @@ class Runner:
         res_step = self.end_iter - self.iter_step
         image_perm = self.get_image_perm()
 
-        for iter_i in tqdm(range(res_step)):
-            data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
+        for _ in tqdm(range(res_step)):
+            data = self.dataset.gen_random_rays_at_psnerf(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
-            rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
+            # rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
+            rays_o, rays_d, true_rgb, true_normal, mask, normal_mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 12], data[:, 12: 13], data[:, 13: 14]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
             background_rgb = None
@@ -114,7 +115,7 @@ class Runner:
             if self.mask_weight > 0.0:
                 mask = (mask > 0.5).float()
             else:
-                mask = torch.ones_like(mask)
+                mask = torch.ones(true_rgb.shape[0], 1).to(self.device)
 
             mask_sum = mask.sum() + 1e-5
             render_out = self.renderer.render(rays_o, rays_d, near, far,
@@ -127,8 +128,10 @@ class Runner:
             gradient_error = render_out['gradient_error']
             weight_max = render_out['weight_max']
             weight_sum = render_out['weight_sum']
+            surface_points_normal = render_out['surface_points_gradients']
+            network_mask = render_out['network_mask']
 
-            # Loss
+            # Photometric Loss
             color_error = (color_fine - true_rgb) * mask
             color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
             psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
@@ -137,9 +140,26 @@ class Runner:
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
 
+            true_normal = torch.einsum('bij,bnj->bni', self.dataset.pose_all[image_perm[self.iter_step % len(image_perm)],:3,:3] * torch.tensor([[[1,-1,-1]]],dtype=torch.float32).to(self.device), true_normal[network_mask].unsqueeze(0)).squeeze(0)
+            true_normal = true_normal / torch.norm(true_normal, dim = -1, keepdim = True)
+            
+            # Normal Loss
+            normal_error = (surface_points_normal - true_normal)
+
+            if(normal_error.shape[0] > 0):
+                normal_loss = F.l1_loss(normal_error, torch.zeros_like(normal_error))
+                self.normal_weight = 1e-6
+            else:
+                normal_loss = 0.0
+                self.normal_weight = 0.0
+            
+            # normal_loss = 0.0
+            # self.normal_weight = 0.0
+
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
-                   mask_loss * self.mask_weight
+                   mask_loss * self.mask_weight +\
+                   normal_loss * self.normal_weight
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -150,6 +170,7 @@ class Runner:
             self.writer.add_scalar('Loss/loss', loss, self.iter_step)
             self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
             self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
+            self.writer.add_scalar('Loss/normal_loss', normal_loss, self.iter_step)
             self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
             self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
             self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
@@ -157,7 +178,7 @@ class Runner:
 
             if self.iter_step % self.report_freq == 0:
                 print(self.base_exp_dir)
-                print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
+                print('iter:{:8>d} loss = {} normal_loss = {} lr={}'.format(self.iter_step, loss, normal_loss, self.optimizer.param_groups[0]['lr']))
 
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
@@ -166,7 +187,10 @@ class Runner:
                 self.validate_image()
 
             if self.iter_step % self.val_mesh_freq == 0:
-                self.validate_mesh()
+                if(self.iter_step > 240000):
+                    self.validate_mesh(save_numpy_sdf = True)
+                else:
+                    self.validate_mesh()
 
             self.update_learning_rate()
 
@@ -174,7 +198,7 @@ class Runner:
                 image_perm = self.get_image_perm()
 
     def get_image_perm(self):
-        return torch.randperm(self.dataset.n_images)
+        return torch.randperm(self.dataset.n_images, device = self.device)
 
     def get_cos_anneal_ratio(self):
         if self.anneal_end == 0.0:
@@ -238,7 +262,7 @@ class Runner:
 
         if resolution_level < 0:
             resolution_level = self.validate_resolution_level
-        rays_o, rays_d = self.dataset.gen_rays_at(idx, resolution_level=resolution_level)
+        rays_o, rays_d = self.dataset.gen_rays_at_psnerf(idx, resolution_level=resolution_level)
         H, W, _ = rays_o.shape
         rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
         rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
@@ -264,6 +288,7 @@ class Runner:
             if feasible('gradients') and feasible('weights'):
                 n_samples = self.renderer.n_samples + self.renderer.n_importance
                 normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
+                # TODO: removed for now
                 if feasible('inside_sphere'):
                     normals = normals * render_out['inside_sphere'][..., None]
                 normals = normals.sum(dim=1).detach().cpu().numpy()
@@ -325,12 +350,12 @@ class Runner:
         img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255).astype(np.uint8)
         return img_fine
 
-    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0):
+    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0, save_numpy_sdf = False):
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)
 
         vertices, triangles =\
-            self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
+            self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold, save_numpy_sdf = save_numpy_sdf)
         os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
 
         if world_space:

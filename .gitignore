@@ -80,6 +80,8 @@ celerybeat-schedule
 # dotenv
 .env
 
+./public_data
+
 # virtualenv
 venv/
 ENV/
