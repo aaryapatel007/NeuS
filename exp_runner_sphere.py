@@ -298,9 +298,13 @@ class Runner:
         normal_img = None
         if len(out_normal_fine) > 0:
             normal_img = np.concatenate(out_normal_fine, axis=0)
-            rot = np.linalg.inv(self.dataset.pose_all[idx, :3, :3].detach().cpu().numpy())
-            normal_img = (np.matmul(rot[None, :, :], normal_img[:, :, None])
-                          .reshape([H, W, 3, -1]) * 128 + 128).clip(0, 255)
+            rot = (self.dataset.pose_all[idx, :3, :3].detach().cpu().numpy()).T
+            normal_img = np.matmul(rot[None, :, :], normal_img[:, :, None]).reshape([H, W, 3, -1])
+            normal_img = normal_img / np.linalg.norm(normal_img, axis=2, keepdims=True)
+            normal_img = (normal_img + 1.0) * 0.5 * 255.0
+
+            # normal_img = (np.matmul(rot[None, :, :], normal_img[:, :, None])
+            #               .reshape([H, W, 3, -1]) * 128 + 128).clip(0, 255)
 
         os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
         os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
