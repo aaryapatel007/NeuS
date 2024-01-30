@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 from shutil import copyfile
 from tqdm import tqdm
 from pyhocon import ConfigFactory
-from models.dataset_psnerf import Dataset
+from models.dataset_sphere import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer_diligent import NeuSRenderer
 
@@ -102,8 +102,7 @@ class Runner:
         for _ in tqdm(range(res_step)):
             data = self.dataset.gen_random_rays_at_psnerf(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
-            # rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
-            rays_o, rays_d, true_rgb, true_normal, mask, normal_mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 12], data[:, 12: 13], data[:, 13: 14]
+            rays_o, rays_d, true_rgb, true_normal, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 12], data[:, 12: 13]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
             background_rgb = None
@@ -138,21 +137,21 @@ class Runner:
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
 
-            true_normal = torch.einsum('bij,bnj->bni', self.dataset.pose_all[image_perm[self.iter_step % len(image_perm)],:3,:3] * torch.tensor([[[1,-1,-1]]],dtype=torch.float32).to(self.device), true_normal[network_mask].unsqueeze(0)).squeeze(0)
-            true_normal = true_normal / torch.norm(true_normal, dim = -1, keepdim = True)
+            # true_normal = torch.einsum('bij,bnj->bni', self.dataset.pose_all[image_perm[self.iter_step % len(image_perm)],:3,:3].unsqueeze(0), true_normal[network_mask].unsqueeze(0)).squeeze(0)
+            # true_normal = true_normal / torch.norm(true_normal, dim = -1, keepdim = True)
             
             # Normal Loss
             normal_error = (surface_points_normal - true_normal)
 
             if(normal_error.shape[0] > 0):
                 normal_loss = F.l1_loss(normal_error, torch.zeros_like(normal_error))
-                self.normal_weight = 1e-6
+                self.normal_weight = 1.0
             else:
                 normal_loss = 0.0
                 self.normal_weight = 0.0
             
-            # normal_loss = 0.0
-            # self.normal_weight = 0.0
+            normal_loss = 0.0
+            self.normal_weight = 0.0
 
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\

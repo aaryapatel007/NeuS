@@ -54,6 +54,10 @@ class Dataset:
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 255.0
         self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
         self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 255.0
+        self.normals_lis = sorted(glob(os.path.join(self.data_dir, 'normal/*.png')))
+        self.normals_np = np.stack([cv.imread(im_name) for im_name in self.normals_lis]) / 255.0
+        self.normals_np = self.normals_np * 2.0 - 1.0
+        self.normals_np /= np.linalg.norm(self.normals_np, axis=-1, keepdims=True)
 
         # world_mat is a projection matrix from world to image
         self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
@@ -75,6 +79,7 @@ class Dataset:
 
         self.images = torch.from_numpy(self.images_np.astype(np.float32)).to(self.device)  # [n_images, H, W, 3]
         self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).to(self.device)   # [n_images, H, W, 3]
+        self.normals = torch.from_numpy(self.normals_np.astype(np.float32)).to(self.device)   # [n_images, H, W, 3]
         self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
         self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
         self.focal = self.intrinsics_all[0][0, 0]
@@ -135,13 +140,14 @@ class Dataset:
         pixels_y = torch.randint(low=0, high=self.H, size=[batch_size], device = self.device)
         color = self.images[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
         mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 3
+        normal = self.normals[img_idx][(pixels_y, pixels_x)]  # batch_size, 3
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
         # pixel to camera coordinate transformation
         p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze() # batch_size, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), mask[:, :1].cpu()], dim=-1).cuda()    # batch_size, 10
+        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), normal.cpu(), mask[:, :1].cpu()], dim=-1).cuda()    # batch_size, 10
     
     def gen_random_rays_at_psnerf(self, img_idx, batch_size):
         """
@@ -152,6 +158,7 @@ class Dataset:
 
         color = self.images[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
         mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 3
+        normal = self.normals[img_idx][(pixels_y, pixels_x)]  # batch_size, 3
         # normal = self.normals[img_idx][(pixels_y, pixels_x)]  # batch_size, 3
         # normal_mask = self.normal_masks[img_idx][(pixels_y, pixels_x)]  # batch_size, 3
         
@@ -170,7 +177,7 @@ class Dataset:
         rays_v = rays_v / torch.linalg.norm(rays_v, ord=2, dim=-1, keepdim=True)
 
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), mask[:, :1].cpu()], dim=-1).cuda()    # batch_size, 10
+        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), normal.cpu(), mask[:, :1].cpu()], dim=-1).cuda()    # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """

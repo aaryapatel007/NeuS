@@ -26,7 +26,7 @@ def find_surface_points(sdf_all, t_all):
     return d_surface, network_mask
 
 
-def extract_fields(bound_min, bound_max, resolution, query_func):
+def extract_fields(bound_min, bound_max, resolution, query_func, sdf_model):
     N = 64
     X = torch.linspace(bound_min[0], bound_max[0], resolution).split(N)
     Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(N)
@@ -37,6 +37,7 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
         for xi, xs in enumerate(X):
             for yi, ys in enumerate(Y):
                 for zi, zs in enumerate(Z):
+                    torch.set_grad_enabled(True)
                     xx, yy, zz = torch.meshgrid(xs, ys, zs)
                     pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1)
                     val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy()
@@ -44,12 +45,14 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
     return u
 
 
-def extract_geometry(bound_min, bound_max, resolution, threshold, query_func, save_numpy_sdf=False):
+def extract_geometry(bound_min, bound_max, resolution, threshold, query_func, sdf_model, save_numpy_sdf=False, case = None):
     print('threshold: {}'.format(threshold))
-    u = extract_fields(bound_min, bound_max, resolution, query_func)
+    u = extract_fields(bound_min, bound_max, resolution, query_func, sdf_model)
     if save_numpy_sdf:
-        np.save("/home/ojaswa/aarya/research_papers_implementation/NeuS/sdf_volume_grid.npy", u)
+        np.save(f"/home/ojaswa/aarya/research_papers_implementation/NeuS/sdf_volume_grid_{case}.npy", u)
     vertices, triangles = mcubes.marching_cubes(u, threshold)
+    # vertices -= 0.5
+    
     b_max_np = bound_max.detach().cpu().numpy()
     b_min_np = bound_min.detach().cpu().numpy()
 
@@ -246,10 +249,11 @@ class NeuSRenderer:
 
         #TODO: comment this out
         # generate random gradients
-        gradients_randn = torch.randn_like(gradients)
+        # gradients_randn = torch.randn_like(gradients)
+        # feature_vector_randn = torch.randn_like(feature_vector)
 
-        # sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
-        sampled_color = color_network(pts, gradients_randn, dirs, feature_vector).reshape(batch_size, n_samples, 3)
+        sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
+        # sampled_color = color_network(pts, gradients_randn, dirs, feature_vector_randn).reshape(batch_size, n_samples, 3)
 
         inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
@@ -438,10 +442,12 @@ class NeuSRenderer:
             'network_mask': network_mask,
         }
 
-    def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0, save_numpy_sdf=False):
+    def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0, save_numpy_sdf=False, case = None):
         return extract_geometry(bound_min,
                                 bound_max,
                                 resolution=resolution,
                                 threshold=threshold,
                                 query_func=lambda pts: -self.sdf_network.sdf(pts),
-                                save_numpy_sdf=save_numpy_sdf)
+                                sdf_model = self.sdf_network,
+                                save_numpy_sdf=save_numpy_sdf,
+                                case = case)

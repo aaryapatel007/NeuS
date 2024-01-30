@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import logging
 import mcubes
-from icecream import ic
 
 
 def extract_fields(bound_min, bound_max, resolution, query_func):
@@ -25,10 +23,14 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
     return u
 
 
-def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
+def extract_geometry(bound_min, bound_max, resolution, threshold, query_func, save_numpy_sdf=False, case = None):
     print('threshold: {}'.format(threshold))
     u = extract_fields(bound_min, bound_max, resolution, query_func)
+    if save_numpy_sdf:
+        np.save(f"/home/ojaswa/aarya/research_papers_implementation/NeuS/sdf_volume_grid_{case}.npy", u)
     vertices, triangles = mcubes.marching_cubes(u, threshold)
+    # vertices -= 0.5
+    
     b_max_np = bound_max.detach().cpu().numpy()
     b_min_np = bound_min.detach().cpu().numpy()
 
@@ -280,7 +282,7 @@ class NeuSRenderer:
             'weights': weights,
             'cdf': c.reshape(batch_size, n_samples),
             'gradient_error': gradient_error,
-            'inside_sphere': inside_sphere
+            'inside_sphere': inside_sphere,
         }
 
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
@@ -374,12 +376,14 @@ class NeuSRenderer:
             'gradients': gradients,
             'weights': weights,
             'gradient_error': ret_fine['gradient_error'],
-            'inside_sphere': ret_fine['inside_sphere']
+            'inside_sphere': ret_fine['inside_sphere'],
         }
 
-    def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):
+    def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0, save_numpy_sdf=False, case = None):
         return extract_geometry(bound_min,
                                 bound_max,
                                 resolution=resolution,
                                 threshold=threshold,
-                                query_func=lambda pts: -self.sdf_network.sdf(pts))
+                                query_func=lambda pts: -self.sdf_network.sdf(pts),
+                                save_numpy_sdf=save_numpy_sdf,
+                                case = case)
