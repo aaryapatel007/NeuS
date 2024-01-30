@@ -103,7 +103,7 @@ class Runner:
             data = self.dataset.gen_random_rays_at_psnerf(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
             # rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
-            rays_o, rays_d, true_rgb, true_normal, mask, normal_mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 12], data[:, 12: 13], data[:, 13: 14]
+            rays_o, rays_d, true_rgb, true_normal, mask, _ = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 12], data[:, 12: 13], data[:, 13: 14]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
             background_rgb = None
@@ -138,15 +138,15 @@ class Runner:
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
 
-            true_normal = torch.einsum('bij,bnj->bni', self.dataset.pose_all[image_perm[self.iter_step % len(image_perm)],:3,:3] * torch.tensor([[[1,-1,-1]]],dtype=torch.float32).to(self.device), true_normal[network_mask].unsqueeze(0)).squeeze(0)
-            true_normal = true_normal / torch.norm(true_normal, dim = -1, keepdim = True)
+            # true_normal = torch.einsum('bij,bnj->bni', self.dataset.pose_all[image_perm[self.iter_step % len(image_perm)],:3,:3] * torch.tensor([[[1,-1,-1]]],dtype=torch.float32).to(self.device), true_normal[network_mask].unsqueeze(0)).squeeze(0)
+            # true_normal = true_normal / torch.norm(true_normal, dim = -1, keepdim = True)
             
             # Normal Loss
             normal_error = (surface_points_normal - true_normal)
 
             if(normal_error.shape[0] > 0):
                 normal_loss = F.l1_loss(normal_error, torch.zeros_like(normal_error))
-                self.normal_weight = 1e-6
+                self.normal_weight = 1.0
             else:
                 normal_loss = 0.0
                 self.normal_weight = 0.0
@@ -299,9 +299,10 @@ class Runner:
         normal_img = None
         if len(out_normal_fine) > 0:
             normal_img = np.concatenate(out_normal_fine, axis=0)
-            rot = np.linalg.inv(self.dataset.pose_all[idx, :3, :3].detach().cpu().numpy())
-            normal_img = (np.matmul(rot[None, :, :], normal_img[:, :, None])
-                          .reshape([H, W, 3, -1]) * 128 + 128).clip(0, 255)
+            rot = (self.dataset.pose_all[idx, :3, :3].detach().cpu().numpy()).T
+            normal_img = np.matmul(rot[None, :, :], normal_img[:, :, None]).reshape([H, W, 3, -1])
+            normal_img = normal_img / np.linalg.norm(normal_img, axis=2, keepdims=True)
+            normal_img = (normal_img + 1.0) * 0.5 * 255.0
 
         os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
         os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)

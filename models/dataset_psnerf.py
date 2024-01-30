@@ -32,15 +32,6 @@ def load_K_Rt_from_P(filename, P=None):
 
     return intrinsics, pose
 
-def generate_random_mask(n_images, height, width):
-    # Generate random values between 0 and 1
-    random_values = torch.rand(n_images, height, width, 3)
-
-    # Threshold the values to create a binary mask
-    threshold = 0.5
-    mask = (random_values > threshold).float()
-
-    return mask
 
 class Dataset:
     def __init__(self, conf):
@@ -58,24 +49,30 @@ class Dataset:
         self.image_num = conf.get_string('image_num')
         self.image_num = "00" + self.image_num if len(self.image_num) == 1 else "0" + self.image_num
 
-        directories = [d for d in os.listdir(self.image_dir) if os.path.isdir(os.path.join(self.image_dir, d))]
+        if(self.data_dir.split('/')[-1] in ['armadillo', 'bunny']):
+            self.images_list = sorted(glob(os.path.join(self.image_dir, 'avg_l96', '*.png')))
+        else:
+            self.images_list = []
+            directories = [d for d in os.listdir(self.image_dir) if os.path.isdir(os.path.join(self.image_dir, d))]
 
-        self.images_list = []
-        # Iterate through each directory
-        for directory in directories:
-            # Construct the full path to the current directory
-            current_directory = os.path.join(self.image_dir, directory)
-            if os.path.isfile(os.path.join(current_directory, self.image_num + '.png')):
-                self.images_list.append(os.path.join(current_directory, self.image_num + '.png'))
+            # Iterate through each directory
+            for directory in directories:
+                # Construct the full path to the current directory
+                current_directory = os.path.join(self.image_dir, directory)
+                if os.path.isfile(os.path.join(current_directory, self.image_num + '.png')):
+                    self.images_list.append(os.path.join(current_directory, self.image_num + '.png'))
 
         self.n_images = len(self.images_list)
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_list]) / 255.0
-        self.normals_list = sorted(glob(os.path.join(self.normal_dir, '*.png')))
+        self.normals_list = sorted(glob(os.path.join(self.normal_dir, '*.npy')))
         self.normal_vecs = np.stack([np.load(normal_file) for normal_file in self.normals_list])
         self.normal_masks_list = sorted(glob(os.path.join(self.normal_mask_dir, '*.png')))
         self.normal_masks_imgs = np.stack([cv.imread(im_name) for im_name in self.normal_masks_list]) / 255.0
         self.masks_lis = sorted(glob(os.path.join(self.mask_dir, '*.png')))
         self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 255.0
+
+        # normalize normal vectors
+        self.normal_vecs = self.normal_vecs / (np.linalg.norm(self.normal_vecs, axis=-1, keepdims=True) + 1e-8)
 
         self.intrinsics_all = []
         self.pose_all = []
@@ -92,7 +89,8 @@ class Dataset:
         self.intrinsics_all = np.tile(intrinsics, (self.n_images, 1)).reshape(self.n_images, intrinsics.shape[0], intrinsics.shape[1])
 
         self.pose_all = np.asarray(camera_calib_dict['pose_c2w']).astype(np.float32)
-        # TODO: commenting this line for now, need to check why this is needed
+
+        # OpenGL to OpenCV coordinate system
         self.pose_all[:,:3,1:3] *= -1.
 
         # self.scale_mats_np = np.tile(np.eye(4), (self.n_images, 1)).reshape(self.n_images, 4, 4)
