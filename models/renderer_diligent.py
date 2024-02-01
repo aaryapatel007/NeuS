@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import mcubes
+import os
 
 def find_surface_points(sdf_all, t_all):
     # sdf_all and t_all: [batch_size, N_rays, N_samples + N_importance]
@@ -33,6 +34,7 @@ def extract_fields(bound_min, bound_max, resolution, query_func, sdf_model):
     Z = torch.linspace(bound_min[2], bound_max[2], resolution).split(N)
 
     u = np.zeros([resolution, resolution, resolution], dtype=np.float32)
+    gradients = np.zeros([resolution, resolution, resolution, 3], dtype=np.float32)
     with torch.no_grad():
         for xi, xs in enumerate(X):
             for yi, ys in enumerate(Y):
@@ -41,17 +43,19 @@ def extract_fields(bound_min, bound_max, resolution, query_func, sdf_model):
                     xx, yy, zz = torch.meshgrid(xs, ys, zs)
                     pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1)
                     val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy()
+                    grad_val = sdf_model.gradient(pts).reshape(len(xs), len(ys), len(zs), 3).detach().cpu().numpy()
                     u[xi * N: xi * N + len(xs), yi * N: yi * N + len(ys), zi * N: zi * N + len(zs)] = val
-    return u
+                    gradients[xi * N: xi * N + len(xs), yi * N: yi * N + len(ys), zi * N: zi * N + len(zs)] = grad_val
+    return u, gradients
 
 
 def extract_geometry(bound_min, bound_max, resolution, threshold, query_func, sdf_model, save_numpy_sdf=False, case = None):
     print('threshold: {}'.format(threshold))
-    u = extract_fields(bound_min, bound_max, resolution, query_func, sdf_model)
+    u, gradients = extract_fields(bound_min, bound_max, resolution, query_func, sdf_model)
     if save_numpy_sdf:
-        np.save(f"/home/ojaswa/aarya/research_papers_implementation/NeuS/sdf_volume_grid_{case}.npy", u)
+        np.save(os.path.join(os.getcwd(), f"../sdf_volume_grid_{case}.npy"), u)
+        np.save(os.path.join(os.getcwd(), f"../sdf_volume_grid_gradients_{case}.npy"), gradients)
     vertices, triangles = mcubes.marching_cubes(u, threshold)
-    # vertices -= 0.5
     
     b_max_np = bound_max.detach().cpu().numpy()
     b_min_np = bound_min.detach().cpu().numpy()

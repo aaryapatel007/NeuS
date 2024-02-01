@@ -71,14 +71,13 @@ class Dataset:
         self.masks_lis = sorted(glob(os.path.join(self.mask_dir, '*.png')))
         self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 255.0
 
-        # normalize normal vectors
-        self.normal_vecs = self.normal_vecs / (np.linalg.norm(self.normal_vecs, axis=-1, keepdims=True) + 1e-8)
-
         self.intrinsics_all = []
         self.pose_all = []
 
         with open(os.path.join(self.data_dir, self.render_cameras_name)) as file:
             camera_calib_dict = json.load(file)
+
+        self.gt_normal_world = camera_calib_dict['gt_normal_world']
 
         K = np.asarray(camera_calib_dict['K'])
 
@@ -90,8 +89,14 @@ class Dataset:
 
         self.pose_all = np.asarray(camera_calib_dict['pose_c2w']).astype(np.float32)
 
+        if(not self.gt_normal_world):
+            self.normal_vecs = np.einsum('bij,bklj->bkli', self.pose_all[:, :3, :3], self.normal_vecs)
+        
         # OpenGL to OpenCV coordinate system
         self.pose_all[:,:3,1:3] *= -1.
+
+        # normalize normal vectors
+        self.normal_vecs = self.normal_vecs / (np.linalg.norm(self.normal_vecs, axis=-1, keepdims=True) + 1e-8)
 
         # self.scale_mats_np = np.tile(np.eye(4), (self.n_images, 1)).reshape(self.n_images, 4, 4)
         self.images = torch.from_numpy(self.images_np.astype(np.float32)).to(self.device)  # [n_images, H, W, 3]
