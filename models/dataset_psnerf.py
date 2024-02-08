@@ -48,6 +48,7 @@ class Dataset:
         self.render_cameras_name = conf.get_string('camera_params')
         self.image_num = conf.get_string('image_num')
         self.image_num = "00" + self.image_num if len(self.image_num) == 1 else "0" + self.image_num
+        self.n_views = conf.get_int('n_views')
 
         if(self.data_dir.split('/')[-1] in ['armadillo', 'bunny']):
             self.images_list = sorted(glob(os.path.join(self.image_dir, 'avg_l96', '*.png')))
@@ -62,13 +63,24 @@ class Dataset:
                 if os.path.isfile(os.path.join(current_directory, self.image_num + '.png')):
                     self.images_list.append(os.path.join(current_directory, self.image_num + '.png'))
 
-        self.n_images = len(self.images_list)
-        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_list]) / 255.0
-        self.normals_list = sorted(glob(os.path.join(self.normal_dir, '*.npy')))
-        self.normal_vecs = np.stack([np.load(normal_file) for normal_file in self.normals_list])
-        self.normal_masks_list = sorted(glob(os.path.join(self.normal_mask_dir, '*.png')))
-        self.normal_masks_imgs = np.stack([cv.imread(im_name) for im_name in self.normal_masks_list]) / 255.0
         self.masks_lis = sorted(glob(os.path.join(self.mask_dir, '*.png')))
+        self.normals_list = sorted(glob(os.path.join(self.normal_dir, '*.npy')))
+        self.normal_masks_list = sorted(glob(os.path.join(self.normal_mask_dir, '*.png')))
+
+
+        # select n_views from the list of images by dividing the total number of images by n_views
+        n_selected_images = len(self.images_list) // self.n_views
+
+        self.images_list = self.images_list[::n_selected_images]
+        self.masks_lis = self.masks_lis[::n_selected_images]
+        self.normals_list = self.normals_list[::n_selected_images]
+        self.normal_masks_list = self.normal_masks_list[::n_selected_images]
+
+        self.n_images = len(self.images_list)
+
+        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_list]) / 255.0
+        self.normal_vecs = np.stack([np.load(normal_file) for normal_file in self.normals_list])
+        self.normal_masks_imgs = np.stack([cv.imread(im_name) for im_name in self.normal_masks_list]) / 255.0
         self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 255.0
 
         self.intrinsics_all = []
@@ -87,7 +99,7 @@ class Dataset:
 
         self.intrinsics_all = np.tile(intrinsics, (self.n_images, 1)).reshape(self.n_images, intrinsics.shape[0], intrinsics.shape[1])
 
-        self.pose_all = np.asarray(camera_calib_dict['pose_c2w']).astype(np.float32)
+        self.pose_all = np.asarray(camera_calib_dict['pose_c2w']).astype(np.float32)[::n_selected_images]
 
         if(not self.gt_normal_world):
             self.normal_vecs = np.einsum('bij,bklj->bkli', self.pose_all[:, :3, :3], self.normal_vecs)
@@ -144,8 +156,8 @@ class Dataset:
         Generate rays at world space from one camera.
         """
         l = resolution_level
-        tx = torch.linspace(0, self.W - 1, self.W // l)
-        ty = torch.linspace(0, self.H - 1, self.H // l)
+        tx = torch.linspace(0, self.W, (self.W // l) + 1)[:-1]
+        ty = torch.linspace(0, self.H, (self.H // l) + 1)[:-1]
         pixels_x, pixels_y = torch.meshgrid(tx, ty)
         # p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1) # W, H, 3
         p = torch.stack([pixels_x, pixels_y], dim=-1) # W, H, 2
