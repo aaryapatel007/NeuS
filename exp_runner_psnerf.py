@@ -13,7 +13,10 @@ from pyhocon import ConfigFactory
 from models.dataset_psnerf import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer_diligent import NeuSRenderer
+from utils.metrics import MAE, PSNR, SSIM, LPIPS
 
+bg = lambda x, mask: x*mask + (mask ^ 1)  ## white background
+to_numpy = lambda x: x.detach().cpu().numpy()
 
 class Runner:
     def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False):
@@ -103,7 +106,7 @@ class Runner:
             data = self.dataset.gen_random_rays_at_psnerf(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
             # rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
-            rays_o, rays_d, true_rgb, true_normal, mask, _ = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 12], data[:, 12: 13], data[:, 13: 14]
+            rays_o, rays_d, true_rgb, true_normal, mask, normal_mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 12], data[:, 12: 13], data[:, 13: 14]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
             background_rgb = None
@@ -111,7 +114,7 @@ class Runner:
                 background_rgb = torch.ones([1, 3])
 
             if self.mask_weight > 0.0:
-                mask = (mask > 0.5).float()
+                mask = (mask > 0.5).int()
             else:
                 mask = torch.ones(true_rgb.shape[0], 1).to(self.device)
 
@@ -133,16 +136,20 @@ class Runner:
             color_error = (color_fine - true_rgb) * mask
             color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
             psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
-
+            # ssim = SSIM(bg(to_numpy(color_fine), to_numpy(mask)), bg(to_numpy(true_rgb), to_numpy(mask)), to_numpy(mask))
+            # lpips = LPIPS()(bg(color_fine, mask), bg(true_rgb, mask), mask)
             eikonal_loss = gradient_error
 
-            mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+            mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask.float())
 
             # true_normal = torch.einsum('bij,bnj->bni', self.dataset.pose_all[image_perm[self.iter_step % len(image_perm)],:3,:3] * torch.tensor([[[1,-1,-1]]],dtype=torch.float32).to(self.device), true_normal[network_mask].unsqueeze(0)).squeeze(0)
             # true_normal = true_normal / torch.norm(true_normal, dim = -1, keepdim = True)
             
             # Normal Loss
-            normal_error = (surface_points_normal - true_normal)
+            normal_error = (surface_points_normal - true_normal) * normal_mask
+
+            # calculate MAE for normal
+            # normal_mae = MAE(bg(to_numpy(surface_points_normal), to_numpy(normal_mask.int())), bg(to_numpy(true_normal), to_numpy(normal_mask.int())), to_numpy(normal_mask.int()))
 
             if(normal_error.shape[0] > 0):
                 normal_loss = F.l1_loss(normal_error, torch.zeros_like(normal_error))
@@ -173,10 +180,13 @@ class Runner:
             self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
             self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
             self.writer.add_scalar('Statistics/psnr', psnr, self.iter_step)
+            # self.writer.add_scalar('Statistics/ssim', ssim, self.iter_step)
+            # self.writer.add_scalar('Statistics/lpips', lpips, self.iter_step)
+            # self.writer.add_scalar('Statistics/normal_mae', normal_mae[0], self.iter_step)
 
             if self.iter_step % self.report_freq == 0:
                 print(self.base_exp_dir)
-                print('iter:{:8>d} loss = {} normal_loss = {} lr={}'.format(self.iter_step, loss, normal_loss, self.optimizer.param_groups[0]['lr']))
+                print('iter:{:8>d} loss = {} normal_loss = {} lr = {} PSNR = {}'.format(self.iter_step, loss, normal_loss, self.optimizer.param_groups[0]['lr'], psnr))
 
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
@@ -260,6 +270,22 @@ class Runner:
 
         if resolution_level < 0:
             resolution_level = self.validate_resolution_level
+
+        l = resolution_level
+        tx = torch.linspace(0, self.dataset.W, (self.dataset.W // l) + 1, dtype = torch.long, device = self.device)[:-1]
+        ty = torch.linspace(0, self.dataset.H, (self.dataset.H // l) + 1, dtype = torch.long, device = self.device)[:-1]
+        pixels_x, pixels_y = torch.meshgrid(tx, ty)
+        # p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1) # W, H, 3
+        color = self.dataset.images[idx][(pixels_y, pixels_x)]    # batch_size, 3
+        mask = self.dataset.masks[idx][(pixels_y, pixels_x)]      # batch_size, 1
+        normal = self.dataset.normals[idx][(pixels_y, pixels_x)]  # batch_size, 3
+        normal_mask = self.dataset.normal_masks[idx][(pixels_y, pixels_x)]  # batch_size, 1
+
+        rgb_color_gt = color.reshape(-1, 3).detach().cpu().numpy()
+        mask_gt = mask.reshape(-1, 3)[:, :1].int().detach().cpu().numpy()
+        normal_gt = normal.reshape(-1, 3).detach().cpu().numpy()
+        normal_mask_gt = normal_mask.reshape(-1, 3)[:, :1].int().detach().cpu().numpy()
+
         rays_o, rays_d = self.dataset.gen_rays_at_psnerf(idx, resolution_level=resolution_level)
         H, W, _ = rays_o.shape
         rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
@@ -293,12 +319,17 @@ class Runner:
             del render_out
 
         img_fine = None
+        rgb_color_pred = np.concatenate(out_rgb_fine, axis=0)
         if len(out_rgb_fine) > 0:
-            img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3, -1]) * 256).clip(0, 255)
+            img_fine = (rgb_color_pred.reshape([H, W, 3, -1]) * 256).clip(0, 255)
+
+        ssim = SSIM(bg(rgb_color_gt, mask_gt), bg(rgb_color_pred, mask_gt), mask_gt)
+        psnr = 20.0 * np.log10(1.0 / np.sqrt(((rgb_color_pred - rgb_color_gt)**2 * mask_gt).sum() / (mask_gt.sum() * 3.0)))
 
         normal_img = None
         if len(out_normal_fine) > 0:
             normal_img = np.concatenate(out_normal_fine, axis=0)
+            normal_mae = MAE(bg(normal_gt, normal_mask_gt), bg(normal_img, normal_mask_gt), normal_mask_gt)
             rot = (self.dataset.pose_all[idx, :3, :3].detach().cpu().numpy()).T
             normal_img = np.matmul(rot[None, :, :], normal_img[:, :, None]).reshape([H, W, 3, -1])
             normal_img = normal_img / np.linalg.norm(normal_img, axis=2, keepdims=True)
@@ -319,6 +350,9 @@ class Runner:
                                         'normals',
                                         '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
                            normal_img[..., i])
+                
+        print('iter:{:8>d} PSNR = {} SSIM = {} normal MAE = {}'.format(self.iter_step, psnr, ssim, normal_mae[0]))
+
 
     def render_novel_image(self, idx_0, idx_1, ratio, resolution_level):
         """
@@ -414,7 +448,7 @@ if __name__ == '__main__':
     if args.mode == 'train':
         runner.train()
     elif args.mode == 'validate_mesh':
-        runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold)
+        runner.validate_mesh(world_space=False, resolution=512, threshold=args.mcube_threshold, save_numpy_sdf = False)
     elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
         _, img_idx_0, img_idx_1 = args.mode.split('_')
         img_idx_0 = int(img_idx_0)
