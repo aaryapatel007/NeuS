@@ -53,15 +53,16 @@ class Dataset:
         if(self.data_dir.split('/')[-1] in ['armadillo', 'bunny']):
             self.images_list = sorted(glob(os.path.join(self.image_dir, 'avg_l96', '*.png')))
         else:
-            self.images_list = []
-            directories = [d for d in os.listdir(self.image_dir) if os.path.isdir(os.path.join(self.image_dir, d))]
+            self.images_list = sorted(glob(os.path.join("".join([self.image_dir, "_intnorm_gt/avg"]), '*.png')))
+            # self.images_list = []
+            # directories = [d for d in os.listdir(self.image_dir) if os.path.isdir(os.path.join(self.image_dir, d))]
 
-            # Iterate through each directory
-            for directory in directories:
-                # Construct the full path to the current directory
-                current_directory = os.path.join(self.image_dir, directory)
-                if os.path.isfile(os.path.join(current_directory, self.image_num + '.png')):
-                    self.images_list.append(os.path.join(current_directory, self.image_num + '.png'))
+            # # Iterate through each directory
+            # for directory in directories:
+            #     # Construct the full path to the current directory
+            #     current_directory = os.path.join(self.image_dir, directory)
+            #     if os.path.isfile(os.path.join(current_directory, self.image_num + '.png')):
+            #         self.images_list.append(os.path.join(current_directory, self.image_num + '.png'))
 
         self.masks_lis = sorted(glob(os.path.join(self.mask_dir, '*.png')))
         self.normals_list = sorted(glob(os.path.join(self.normal_dir, '*.npy')))
