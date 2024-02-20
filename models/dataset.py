@@ -32,7 +32,6 @@ def load_K_Rt_from_P(filename, P=None):
 
     return intrinsics, pose
 
-
 class Dataset:
     def __init__(self, conf):
         super(Dataset, self).__init__()
@@ -41,6 +40,7 @@ class Dataset:
         self.conf = conf
 
         self.data_dir = conf.get_string('data_dir')
+        self.normal_dir = conf.get_string('normal_dir')
         self.render_cameras_name = conf.get_string('render_cameras_name')
         self.object_cameras_name = conf.get_string('object_cameras_name')
 
@@ -50,6 +50,8 @@ class Dataset:
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
         self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
+        self.normals_list = sorted(glob(os.path.join(self.normal_dir, '*.npy')))
+        self.camera_normal_vecs = np.stack([np.load(normal_file) for normal_file in self.normals_list])
         self.n_images = len(self.images_lis)
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 255.0
         self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
@@ -63,22 +65,30 @@ class Dataset:
         # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
         self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
 
-        self.intrinsics_all = []
-        self.pose_all = []
+        self.intrinsics_all = np.zeros((self.n_images, 4, 4), dtype=np.float32)
+        self.pose_all = np.zeros((self.n_images, 4, 4), dtype=np.float32)
 
-        for scale_mat, world_mat in zip(self.scale_mats_np, self.world_mats_np):
+        for i, (scale_mat, world_mat) in enumerate(zip(self.scale_mats_np, self.world_mats_np)):
             P = world_mat @ scale_mat
             P = P[:3, :4]
             intrinsics, pose = load_K_Rt_from_P(None, P)
-            self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
-            self.pose_all.append(torch.from_numpy(pose).float())
+            self.intrinsics_all[i] = intrinsics.astype(np.float32)
+            self.pose_all[i] = pose
+
+        # camera to world normals
+        self.normal_vecs = np.einsum('bij,bklj->bkli', self.pose_all[:, :3, :3], self.camera_normal_vecs)
+        # self.normal_vecs = self.camera_normal_vecs
+
+        # normalize normal vectors
+        self.normal_vecs = self.normal_vecs / (np.linalg.norm(self.normal_vecs, axis=-1, keepdims=True) + 1e-8)
 
         self.images = torch.from_numpy(self.images_np.astype(np.float32)).to(self.device)  # [n_images, H, W, 3]
         self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).to(self.device)   # [n_images, H, W, 3]
-        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
+        self.normals = torch.from_numpy(self.normal_vecs.astype(np.float32)).to(self.device)  # [n_images, H, W, 3]
+        self.intrinsics_all = torch.from_numpy(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
         self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
         self.focal = self.intrinsics_all[0][0, 0]
-        self.pose_all = torch.stack(self.pose_all).to(self.device)  # [n_images, 4, 4]
+        self.pose_all = torch.from_numpy(self.pose_all).to(self.device)  # [n_images, 4, 4]
         self.H, self.W = self.images.shape[1], self.images.shape[2]
         self.image_pixels = self.H * self.W
 
@@ -135,6 +145,7 @@ class Dataset:
         pixels_y = torch.randint(low=0, high=self.H, size=[batch_size], device = self.device)
         color = self.images[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
         mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 3
+        # normal = self.normals[img_idx][(pixels_y, pixels_x)]
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
         # pixel to camera coordinate transformation
         p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze() # batch_size, 3
@@ -152,7 +163,7 @@ class Dataset:
 
         color = self.images[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
         mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 3
-        # normal = self.normals[img_idx][(pixels_y, pixels_x)]  # batch_size, 3
+        normal = self.normals[img_idx][(pixels_y, pixels_x)]  # batch_size, 3
         # normal_mask = self.normal_masks[img_idx][(pixels_y, pixels_x)]  # batch_size, 3
         
         # p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
@@ -170,7 +181,7 @@ class Dataset:
         rays_v = rays_v / torch.linalg.norm(rays_v, ord=2, dim=-1, keepdim=True)
 
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), mask[:, :1].cpu()], dim=-1).cuda()    # batch_size, 10
+        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), normal.cpu(), mask[:, :1].cpu()], dim=-1).cuda()    # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """
@@ -216,4 +227,3 @@ class Dataset:
     def image_at(self, idx, resolution_level):
         img = cv.imread(self.images_lis[idx])
         return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
-

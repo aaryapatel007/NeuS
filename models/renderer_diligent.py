@@ -310,6 +310,17 @@ class NeuSRenderer:
         
         gradients_surface = torch.gather(gradients.reshape(batch_size, n_samples, 3)[network_mask], dim=1, index=max_indices[network_mask].view(-1, 1, 1).expand(-1, 1, 3)).squeeze(1)
 
+        # gradient consistency loss (alignment error) https://arxiv.org/abs/2305.11601
+        gradient_norm = F.normalize(gradients, dim=-1) # [batch_size * n_samples, 3]
+        pts_moved = pts + gradient_norm * sdf # [batch_size * n_samples, 3]
+
+        _ = sdf_network(pts_moved)[:, :1]
+        gradient_moved = sdf_network.gradient(pts_moved).squeeze()
+        gradient_moved_norm = F.normalize(gradient_moved, dim=-1)
+        consis_constraint = 1 - F.cosine_similarity(gradient_moved_norm, gradient_norm, dim=-1)
+        weight_moved = torch.exp(-10 * torch.abs(sdf)).reshape(-1,consis_constraint.shape[-1]) 
+        consis_constraint = consis_constraint * weight_moved
+
         # sdf_all = sdf.reshape(batch_size, n_samples).unsqueeze(0)
         # t_all = mid_z_vals.reshape(batch_size, n_samples).unsqueeze(0)
 
@@ -343,6 +354,7 @@ class NeuSRenderer:
             'weights': weights,
             'cdf': c.reshape(batch_size, n_samples),
             'gradient_error': gradient_error,
+            'alignment_error': consis_constraint.sum(),
             'inside_sphere': inside_sphere,
             'network_mask': network_mask,
             'surface_points_gradients': gradients_surface,
@@ -441,6 +453,7 @@ class NeuSRenderer:
             'gradients': gradients,
             'weights': weights,
             'gradient_error': ret_fine['gradient_error'],
+            'alignment_error': ret_fine['alignment_error'],
             'inside_sphere': ret_fine['inside_sphere'],
             'surface_points_gradients': surface_points_gradients,
             'network_mask': network_mask,

@@ -1,5 +1,4 @@
 import os
-import time
 import logging
 import argparse
 import numpy as np
@@ -9,7 +8,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from shutil import copyfile
-from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
 from models.dataset import Dataset
@@ -166,7 +164,10 @@ class Runner:
                 self.validate_image()
 
             if self.iter_step % self.val_mesh_freq == 0:
-                self.validate_mesh()
+                if(self.iter_step > 24000):
+                    self.validate_mesh(save_numpy_sdf = True)
+                else:
+                    self.validate_mesh()
 
             self.update_learning_rate()
 
@@ -325,12 +326,12 @@ class Runner:
         img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255).astype(np.uint8)
         return img_fine
 
-    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0):
+    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0, save_numpy_sdf = False):
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)
 
         vertices, triangles =\
-            self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
+            self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold, save_numpy_sdf = save_numpy_sdf, case = args.case)
         os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
 
         if world_space:

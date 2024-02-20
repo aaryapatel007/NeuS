@@ -53,6 +53,7 @@ class Runner:
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight')
+        self.alignment_weight = self.conf.get_float('train.align_weight')
         self.is_continue = is_continue
         self.mode = mode
         self.model_list = []
@@ -127,10 +128,11 @@ class Runner:
             s_val = render_out['s_val']
             cdf_fine = render_out['cdf_fine']
             gradient_error = render_out['gradient_error']
+            alignment_error = render_out['alignment_error']
             weight_max = render_out['weight_max']
             weight_sum = render_out['weight_sum']
             surface_points_normal = render_out['surface_points_gradients']
-            network_mask = render_out['network_mask']
+            # network_mask = render_out['network_mask']
 
             # Photometric Loss
             color_error = (color_fine - true_rgb) * mask
@@ -139,6 +141,7 @@ class Runner:
             # ssim = SSIM(bg(to_numpy(color_fine), to_numpy(mask)), bg(to_numpy(true_rgb), to_numpy(mask)), to_numpy(mask))
             # lpips = LPIPS()(bg(color_fine, mask), bg(true_rgb, mask), mask)
             eikonal_loss = gradient_error
+            gradient_cosistency_loss = alignment_error
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask.float())
 
@@ -164,6 +167,7 @@ class Runner:
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
                    mask_loss * self.mask_weight +\
+                    gradient_cosistency_loss * self.alignment_weight +\
                    normal_loss * self.normal_weight
 
             self.optimizer.zero_grad()
@@ -175,6 +179,7 @@ class Runner:
             self.writer.add_scalar('Loss/loss', loss, self.iter_step)
             self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
             self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
+            self.writer.add_scalar('Loss/gradient_cosistency_loss', gradient_cosistency_loss, self.iter_step)
             self.writer.add_scalar('Loss/normal_loss', normal_loss, self.iter_step)
             self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
             self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
