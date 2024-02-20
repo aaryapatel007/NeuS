@@ -185,7 +185,7 @@ class Dataset:
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), normal.cpu(), depth.cpu(), mask[:, :1].cpu()], dim=-1).cuda(), intrinsics_pair, intrinsics_inv_pair, poses_pair, images_gray_pair    # batch_size, 10
+        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), normal.cpu(), depth.unsqueeze(1).cpu(), mask[:, :1].cpu()], dim=-1).cuda(), intrinsics_pair, intrinsics_inv_pair, poses_pair, images_gray_pair    # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """
