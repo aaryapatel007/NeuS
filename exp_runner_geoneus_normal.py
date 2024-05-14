@@ -10,17 +10,27 @@ from torch.utils.tensorboard import SummaryWriter
 from shutil import copyfile
 from tqdm import tqdm
 from pyhocon import ConfigFactory
-from models.dataset_bmvs import Dataset
+from models.dataset_geoneus import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer_diligent import NeuSRenderer
+# from plyfile import PlyData, PlyElement
+from models import mesh_filtering
+from skimage import morphology as morph
+import pandas as pd
+from pathlib import Path
 
+torch.cuda.manual_seed(2024)
+torch.manual_seed(2024)
 
 class Runner:
-    def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False, checkpoint = False):
+    def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False, checkpoint=False, suffix=''):
         self.device = torch.device('cuda')
 
         # Configuration
         self.conf_path = conf_path
+        self.suffix = suffix
+        self.case = case
+
         f = open(self.conf_path)
         conf_text = f.read()
         conf_text = conf_text.replace('CASE_NAME', case)
@@ -86,7 +96,7 @@ class Runner:
                  if model_name[-3:] == 'pth' and int(model_name[5:-4]) <= self.end_iter:
                      model_list.append(model_name)
              model_list.sort()
-             latest_model_name = model_list[checkpoint-1]
+             latest_model_name = model_list[-1]
 
         if is_continue:
             model_list_raw = os.listdir(os.path.join(self.base_exp_dir, 'checkpoints'))
@@ -111,10 +121,12 @@ class Runner:
         res_step = self.end_iter - self.iter_step
         image_perm = self.get_image_perm()
 
-        for _ in tqdm(range(res_step)):
+        for iter_i in tqdm(range(res_step)):
+            torch.cuda.manual_seed(iter_i)
+            torch.manual_seed(iter_i)
             data, pose_c2w, intrinsics = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
-            rays_o, rays_d, true_rgb, true_normal, true_depth, mask = data[:, :3], data[:, 3: 6], data[:, 6 : 9], data[:, 9 : 12], data[:, 12 : 13], data[:, 13 : 14]
+            rays_o, rays_d, true_rgb, true_normal, true_depth, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9 : 12], data[:, 12 : 13], data[:, 13 : 14],
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
             background_rgb = None
@@ -128,8 +140,8 @@ class Runner:
 
             mask_sum = mask.sum() + 1e-5
             render_out = self.renderer.render(rays_o, rays_d, near, far,
-                                              background_rgb=background_rgb,
-                                              cos_anneal_ratio=self.get_cos_anneal_ratio())
+                                            background_rgb=background_rgb,
+                                            cos_anneal_ratio=self.get_cos_anneal_ratio())
 
             color_fine = render_out['color_fine']
             s_val = render_out['s_val']
@@ -171,16 +183,34 @@ class Runner:
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask.float())
 
-            # normal_error = (surface_points_normal - true_normal) * mask
+            normal_error = (surface_points_normal - true_normal) * mask
 
-            # if(normal_error.shape[0] > 0):
-            #     normal_loss = F.l1_loss(normal_error, torch.zeros_like(normal_error))
+            if(normal_error.shape[0] > 0):
+                normal_loss = F.l1_loss(normal_error, torch.zeros_like(normal_error))
+            else:
+                normal_loss = 0.0
+
+            # if(depth_error.shape[0] > 0):
+            #     depth_loss = F.l1_loss(depth_error, torch.zeros_like(depth_error), reduction='sum') / mask_sum
             # else:
-            #     normal_loss = 0.0
+            #     depth_loss = 0.0
+                
+            # loss = color_fine_loss +\
+            #        eikonal_loss * self.igr_weight +\
+            #        mask_loss * self.mask_weight +\
+            #        gradient_cosistency_loss * self.alignment_weight +\
+            #        normal_loss * self.normal_weight +\
+            #        depth_loss * self.depth_weight +\
+            #        sdf_loss +\
+            #        ncc_loss
 
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
+                    normal_loss * self.normal_weight +\
+                    bias_loss * self.bias_weight +\
+                    sparse_loss * self.sparse_weight +\
                    mask_loss * self.mask_weight
+            
             
             self.optimizer.zero_grad()
             loss.backward()
@@ -190,12 +220,12 @@ class Runner:
 
             self.writer.add_scalar('Loss/loss', loss, self.iter_step)
             self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
-            self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
-            # self.writer.add_scalar('Loss/sparse_loss', sparse_loss, self.iter_step)
-            # self.writer.add_scalar('Loss/bias_loss', bias_loss, self.iter_step)
-            # self.writer.add_scalar('Loss/normal_loss', normal_loss, self.iter_step)
-            self.writer.add_scalar('Loss/mask_loss', mask_loss, self.iter_step)
             # self.writer.add_scalar('Loss/depth_loss', depth_loss, self.iter_step)
+            self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
+            self.writer.add_scalar('Loss/sparse_loss', sparse_loss, self.iter_step)
+            self.writer.add_scalar('Loss/bias_loss', bias_loss, self.iter_step)
+            self.writer.add_scalar('Loss/normal_loss', normal_loss, self.iter_step)
+            self.writer.add_scalar('Loss/mask_loss', mask_loss, self.iter_step)
             self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
             self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
             self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
@@ -203,19 +233,20 @@ class Runner:
 
             if self.iter_step % self.report_freq == 0:
                 print(self.base_exp_dir)
-                # print('iter:{:8>d} loss = {} eikonal_loss = {} sparse_loss = {} bias_loss = {} normal_loss = {} mask_loss = {} lr = {} PSNR = {}'.format(self.iter_step, loss, eikonal_loss, sparse_loss, bias_loss, normal_loss, mask_loss, self.optimizer.param_groups[0]['lr'], psnr))
-                print('iter:{:8>d} loss = {} eikonal_loss = {} mask_loss = {} lr = {} PSNR = {}'.format(self.iter_step, loss, eikonal_loss, mask_loss, self.optimizer.param_groups[0]['lr'], psnr))
-
+                print('iter:{:8>d} loss = {} color_loss = {} normal_loss = {} sparse_loss = {} bias_loss = {} eikonal_loss = {} mask_loss = {} lr = {} PSNR = {}'.format(self.iter_step, loss, color_fine_loss, normal_loss, sparse_loss, bias_loss, eikonal_loss, mask_loss, self.optimizer.param_groups[0]['lr'], psnr))
+                # print('iter:{:8>d} loss = {} color_loss = {} eikonal_loss = {} mask_loss = {} lr = {} PSNR = {}'.format(self.iter_step, loss, color_fine_loss, eikonal_loss, mask_loss, self.optimizer.param_groups[0]['lr'], psnr))
+                
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
 
             if self.iter_step % self.val_freq == 0:
+                np.random.seed(iter_i)  # seed
                 self.validate_image()
 
             if self.iter_step == self.end_iter:
-                self.validate_mesh(world_space=True, resolution=512)
+                self.validate_mesh_ori(world_space=False, resolution=512)
             elif self.iter_step % self.val_mesh_freq == 0:
-                self.validate_mesh()
+                self.validate_mesh_ori()
 
             self.update_learning_rate()
 
@@ -295,6 +326,7 @@ class Runner:
         out_rgb_fine = []
         out_normal_fine = []
         out_depth_fine = []
+        out_ncc_fine = []
 
         for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
             near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
@@ -333,12 +365,17 @@ class Runner:
             del render_out
 
         img_fine = None
-        rgb_color_pred = np.concatenate(out_rgb_fine, axis=0)
         if len(out_rgb_fine) > 0:
-            img_fine = (rgb_color_pred.reshape([H, W, 3, -1]) * 256).clip(0, 255)
+            img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3, -1]) * 256).clip(0, 255)
 
-        # ssim = SSIM(bg(rgb_color_gt, mask_gt), bg(rgb_color_pred, mask_gt), mask_gt)
-        # psnr = 20.0 * np.log10(1.0 / np.sqrt(((rgb_color_pred - rgb_color_gt)**2 * mask_gt).sum() / (mask_gt.sum() * 3.0)))
+        depth_fine = None
+        if len(out_depth_fine) > 0:
+            depth_fine = np.concatenate(out_depth_fine, axis=0).reshape([H, W, 1, -1])
+            depth_fine[depth_fine < 0] = 0
+            
+        # ncc_cost = None
+        # if len(out_ncc_fine) > 0:
+        #     ncc_cost = np.concatenate(out_ncc_fine, axis=0).reshape([H, W, 1, -1])
 
         normal_img = None
         if len(out_normal_fine) > 0:
@@ -347,11 +384,6 @@ class Runner:
             normal_img = np.matmul(rot[None, :, :], normal_img[:, :, None]).reshape([H, W, 3, -1])
             normal_img = normal_img / np.linalg.norm(normal_img, axis=2, keepdims=True)
             normal_img = (normal_img + 1.0) * 0.5 * 255.0
-        
-        depth_fine = None
-        if len(out_depth_fine) > 0:
-            depth_fine = np.concatenate(out_depth_fine, axis=0).reshape([H, W, 1, -1])
-            depth_fine[depth_fine < 0] = 0
 
         os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
         os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
@@ -404,7 +436,7 @@ class Runner:
         img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255).astype(np.uint8)
         return img_fine
 
-    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0):
+    def validate_mesh_ori(self, world_space=False, resolution=64, threshold=0.0):
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)
 
@@ -417,6 +449,124 @@ class Runner:
 
         mesh = trimesh.Trimesh(vertices, triangles)
         mesh.export(os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}.ply'.format(self.iter_step)))
+
+        logging.info('End')
+
+    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0, dilation=15):
+        torch.set_default_dtype(torch.float32)
+        bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
+        bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)
+
+        vertices, triangles =\
+            self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
+        os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
+
+        mesh = trimesh.Trimesh(vertices, triangles)
+
+        # scan_name = self.base_exp_dir.split('/')[-1]
+
+        no_masks = False
+        one_cc = True
+        dilation_radius = dilation
+        
+        K = self.dataset.intrinsics_all
+        pose = self.dataset.pose_all
+        masks = self.dataset.masks_np
+
+
+        masks = [masks[i, :, :, 0].squeeze() for i in range(masks.shape[0])]
+
+        print("dilation...")
+        dilated_masks = list()
+
+        for m in tqdm(masks, desc="Mask dilation"):
+            if no_masks:
+                dilated_masks.append(torch.ones_like(m, device="cuda"))
+            else:
+                struct_elem = morph.disk(dilation_radius)
+                dilated_masks.append(torch.from_numpy(morph.binary_dilation(m, struct_elem)))
+        masks = torch.stack(dilated_masks).cuda()
+
+        with torch.no_grad():
+            size = [1600, 1200]
+            pose = pose.cuda()
+            cams = [
+                K[:, :3, :3].cuda(),
+                pose[:, :3, :3].transpose(2, 1),
+                - pose[:, :3, :3].transpose(2, 1) @ pose[:, :3, 3:],
+                torch.tensor([size for i in range(self.dataset.n_images)]).cuda().float()
+            ]
+
+        mesh_filtering.mesh_filter(mesh, masks, cams)
+
+        if one_cc:  # Taking the biggest connected component
+            components = mesh.split(only_watertight=False)
+            areas = np.array([c.area for c in components], dtype=float)
+            mesh = components[areas.argmax()]
+
+        if world_space:
+            mesh.apply_transform(self.dataset.scale_mats_np[0])
+
+        mesh.export(os.path.join(self.base_exp_dir, 'meshes', f'output_mesh{self.suffix}.ply'))
+
+        logging.info('End')
+
+    def validate_mesh_womask(self, world_space=False, resolution=64, threshold=0.0, dilation=15):
+        bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
+        bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)
+
+        vertices, triangles =\
+            self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
+        os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
+
+        mesh = trimesh.Trimesh(vertices, triangles)
+
+        # scan_name = self.base_exp_dir.split('/')[-1]
+
+        no_masks = True
+        one_cc = True
+        dilation_radius = dilation
+        K = self.dataset.intrinsics_all
+        pose = self.dataset.pose_all
+        masks = self.dataset.masks_np
+        masks = [masks[i, :, :, 0].squeeze() for i in range(masks.shape[0])]
+
+        print("dilation...")
+        dilated_masks = list()
+
+        for m in tqdm(masks, desc="Mask dilation"):
+            if no_masks:
+                dilated_masks.append(torch.ones_like(torch.from_numpy(m), device="cuda"))
+            else:
+                struct_elem = morph.disk(dilation_radius)
+                dilated_masks.append(torch.from_numpy(morph.binary_dilation(m, struct_elem)))
+        masks = torch.stack(dilated_masks).cuda()
+
+        with torch.no_grad():
+            size = [1600, 1200]
+            pose = pose.cuda()
+            cams = [
+                K[:, :3, :3].cuda(),
+                pose[:, :3, :3].transpose(2, 1),
+                - pose[:, :3, :3].transpose(2, 1) @ pose[:, :3, 3:],
+                torch.tensor([size for i in range(self.dataset.n_images)]).cuda().float()
+            ]
+
+        mesh_filtering.mesh_filter(mesh, masks, cams)
+
+        if one_cc:  # Taking the biggest connected component
+            components = mesh.split(only_watertight=False)
+            areas = np.array([c.area for c in components], dtype=float)
+            mesh = components[areas.argmax()]
+
+        vertices = mesh.vertices
+        triangles = mesh.faces
+
+        if world_space:
+            vertices = vertices * self.dataset.scale_mats_np[0][0, 0] + self.dataset.scale_mats_np[0][:3, 3][None]
+
+        mesh = trimesh.Trimesh(vertices, triangles)
+        mesh.export(os.path.join(self.base_exp_dir, 'meshes', f'output_mesh{self.suffix}.ply'))
 
         logging.info('End')
 
@@ -462,16 +612,26 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=int, default=0)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--case', type=str, default='')
+    parser.add_argument("--suffix", default="")
+    parser.add_argument("--dilation", type=int, default=15)
 
     args = parser.parse_args()
 
     torch.cuda.set_device(args.gpu)
-    runner = Runner(args.conf, args.mode, args.case, args.is_continue)
+    runner = Runner(args.conf, args.mode, args.case, args.is_continue, args.checkpoint, args.suffix)
 
     if args.mode == 'train':
         runner.train()
     elif args.mode == 'validate_mesh':
-        runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold)
+        runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold, dilation=args.dilation) # 512
+    # elif args.mode == 'validate_mesh_womask':
+    #     runner.validate_mesh_womask(world_space=True, resolution=512, threshold=args.mcube_threshold, dilation=args.dilation) # 512
+    elif args.mode == 'validate_mesh_ori':
+        runner.validate_mesh_ori(world_space=False, resolution=512, threshold=args.mcube_threshold) # 512
+    elif args.mode == 'validate_image':
+        runner.validate_image()
+    elif args.mode == 'eval_image':
+        runner.eval_image()
     elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
         _, img_idx_0, img_idx_1 = args.mode.split('_')
         img_idx_0 = int(img_idx_0)

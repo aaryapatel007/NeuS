@@ -250,7 +250,14 @@ class NeuSRenderer:
         feature_vector = sdf_nn_output[:, 1:]
 
         gradients = sdf_network.gradient(pts).squeeze()
+
+        #TODO: comment this out
+        # generate random gradients
+        # gradients_randn = torch.randn_like(gradients)
+        # feature_vector_randn = torch.randn_like(feature_vector)
+
         sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
+        # sampled_color = color_network(pts, gradients_randn, dirs, feature_vector_randn).reshape(batch_size, n_samples, 3)
 
         inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
@@ -278,9 +285,6 @@ class NeuSRenderer:
         inside_sphere = (pts_norm < 1.0).float().detach()
         relax_inside_sphere = (pts_norm < 1.2).float().detach()
 
-        alpha_in = alpha
-        weights_in = alpha_in * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha_in + 1e-7], -1), -1)[:, :-1]
-
         # Render with background
         if background_alpha is not None:
             alpha = alpha * inside_sphere + background_alpha[:, :n_samples] * (1.0 - inside_sphere)
@@ -301,54 +305,48 @@ class NeuSRenderer:
                                             dim=-1) - 1.0) ** 2
         gradient_error = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
 
-        # Sparse loss
-        sparse_loss = torch.exp(-torch.abs(sdf) * 100.0).mean()
+        # gradient consistency loss (alignment error) https://arxiv.org/abs/2305.11601
+        # gradient_norm = F.normalize(gradients, dim=-1) # [batch_size * n_samples, 3]
+        # pts_moved = pts + gradient_norm * sdf # [batch_size * n_samples, 3]
 
-        # bias loss
-        t_rendered = torch.sum(weights * mid_z_vals / (torch.sum(weights, dim=-1, keepdim=True) + 1e-6), dim=-1, keepdim=True)
-        pts_rendered = rays_o + rays_d * t_rendered
-        sdf_rendered = sdf_network.sdf(pts_rendered)[:, :1]
-        bias_loss = F.l1_loss(sdf_rendered, torch.zeros_like(sdf_rendered), reduction='mean')
+        # _ = sdf_network(pts_moved)[:, :1]
+        # gradient_moved = sdf_network.gradient(pts_moved).squeeze()
+        # gradient_moved_norm = F.normalize(gradient_moved, dim=-1)
+        # consis_constraint = 1 - F.cosine_similarity(gradient_moved_norm, gradient_norm, dim=-1)
+        # weight_moved = torch.exp(-10 * torch.abs(sdf)).reshape(-1,consis_constraint.shape[-1]) 
+        # consis_constraint = consis_constraint * weight_moved
 
-        max, max_indices = torch.max(weights, dim=-1)
-        network_mask = max_indices < n_samples
-        
-        gradients_surface = torch.gather(gradients.reshape(batch_size, n_samples, 3)[network_mask], dim=1, index=max_indices[network_mask].view(-1, 1, 1).expand(-1, 1, 3)).squeeze(1)
-        
-        # normalize the gradients
-        gradients_surface = gradients_surface / torch.linalg.norm(gradients_surface, ord=2, dim=-1, keepdim=True)
+        sdf_all = sdf.reshape(batch_size, n_samples)
+        t_all = mid_z_vals.reshape(batch_size, n_samples)
 
+        sdf0 = sdf_all[..., :-1] * sdf_all[..., 1:] <= 0.0
+        sdf1 = sdf_all[..., :-1] > sdf_all[..., 1:]
 
-        sdf_d = sdf.reshape(batch_size, n_samples)
-        prev_sdf, next_sdf = sdf_d[:, :-1], sdf_d[:, 1:]
-        sign = prev_sdf * next_sdf
-        sign = torch.where(sign <= 0, torch.ones_like(sign), torch.zeros_like(sign))
-        idx = reversed(torch.Tensor(range(1, n_samples)).cuda())
-        tmp = torch.einsum("ab,b->ab", (sign, idx))
-        prev_idx = torch.argmax(tmp, 1, keepdim=True)
+        sdf_bool = sdf0 & sdf1
+
+        idx = reversed(torch.arange(1, n_samples)).cuda()
+        mul = torch.multiply(sdf_bool, idx)
+        prev_idx = torch.argmax(mul, dim=-1).unsqueeze(-1)
         next_idx = prev_idx + 1
 
-        prev_inside_sphere = torch.gather(inside_sphere, 1, prev_idx)
-        next_inside_sphere = torch.gather(inside_sphere, 1, next_idx)
-        mid_inside_sphere = (0.5 * (prev_inside_sphere + next_inside_sphere) > 0.5).float()
-        sdf1 = torch.gather(sdf_d, 1, prev_idx)
-        sdf2 = torch.gather(sdf_d, 1, next_idx)
-        z_vals1 = torch.gather(mid_z_vals, 1, prev_idx)
-        z_vals2 = torch.gather(mid_z_vals, 1, next_idx)
-        z_vals_sdf0 = (sdf1 * z_vals2 - sdf2 * z_vals1) / (sdf1 - sdf2 + 1e-10)
-        z_vals_sdf0 = torch.where(z_vals_sdf0 < 0, torch.zeros_like(z_vals_sdf0), z_vals_sdf0)
-        max_z_val = torch.max(z_vals)
-        z_vals_sdf0 = torch.where(z_vals_sdf0 > max_z_val, torch.zeros_like(z_vals_sdf0), z_vals_sdf0)
-        pts_sdf0 = rays_o[:, None, :] + rays_d[:, None, :] * z_vals_sdf0[..., :, None]  # [batch_size, 1, 3]
-        # gradients_sdf0 = sdf_network.gradient(pts_sdf0.reshape(-1, 3)).squeeze().reshape(batch_size, 1, 3)
-        # gradients_sdf0 = gradients_sdf0 / torch.linalg.norm(gradients_sdf0, ord=2, dim=-1, keepdim=True)
+        prev_inside_sphere = inside_sphere.gather(1, prev_idx)
+        next_inside_sphere = inside_sphere.gather(1, next_idx)
+        mid_inside_sphere = ((prev_inside_sphere + next_inside_sphere) * 0.5 > 0.5).float()
 
-        # project_xyz = torch.matmul(poses[:3, :3].permute(1, 0), pts_sdf0.permute(0, 2, 1))
-        # t = - torch.matmul(poses[:3, :3].permute(1, 0), poses[:3, 3, None])
-        # project_xyz = project_xyz + t
-        # project_xyz = torch.matmul(intrinsics[:3, :3], project_xyz)  # [batch_size, 3, 1]
-        # depth_sdf = project_xyz[:, 2, 0] * mid_inside_sphere.squeeze(1)
+        sdf_prev = sdf_all.gather(1, prev_idx)
+        sdf_next = sdf_all.gather(1, next_idx)
+        t_prev = t_all.gather(1, prev_idx)
+        t_next = t_all.gather(1, next_idx)
 
+        t_surface = (sdf_prev * t_next - sdf_next * t_prev) / (sdf_prev - sdf_next)
+        t_surface = torch.where(t_surface < 0.0, torch.zeros_like(t_surface), t_surface)
+        max_z_vals = torch.max(z_vals)
+        t_surface = torch.where(t_surface > max_z_vals, torch.zeros_like(t_surface), t_surface)
+
+        # surface points
+        surface_pts = rays_o[:, None, :] + rays_d[:, None, :] * t_surface[..., :, None] # [batch_size, 1, 3]
+        surface_grads = sdf_network.gradient(surface_pts.squeeze()) # [batch_size, 1, 3]
+        surface_grads = surface_grads / torch.linalg.norm(surface_grads, ord=2, dim=-1, keepdim=True)
 
         return {
             'color': color,
@@ -360,13 +358,10 @@ class NeuSRenderer:
             'weights': weights,
             'cdf': c.reshape(batch_size, n_samples),
             'gradient_error': gradient_error,
-            'sparse_loss': sparse_loss,
-            'bias_loss': bias_loss,
             'inside_sphere': inside_sphere,
-            # 'depth_sdf': depth_sdf,
+            'surface_points_gradients': surface_grads,
             'mid_inside_sphere': mid_inside_sphere,
-            'surface_points': pts_sdf0,
-            'surface_points_gradients': gradients_surface,
+            'surface_points': surface_pts,
         }
 
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
@@ -446,6 +441,7 @@ class NeuSRenderer:
                                     cos_anneal_ratio=cos_anneal_ratio)
 
         color_fine = ret_fine['color']
+        surface_points_gradients = ret_fine['surface_points_gradients']
         weights = ret_fine['weights']
         weights_sum = weights.sum(dim=-1, keepdim=True)
         gradients = ret_fine['gradients']
@@ -459,13 +455,12 @@ class NeuSRenderer:
             'weight_max': torch.max(weights, dim=-1, keepdim=True)[0],
             'gradients': gradients,
             'weights': weights,
-            'sparse_loss': ret_fine['sparse_loss'],
-            'bias_loss': ret_fine['bias_loss'],
             'gradient_error': ret_fine['gradient_error'],
+            # 'alignment_error': ret_fine['alignment_error'],
             'inside_sphere': ret_fine['inside_sphere'],
-            'surface_points_gradients': ret_fine['surface_points_gradients'],
-            'surface_points': ret_fine['surface_points'],
+            'surface_points_gradients': surface_points_gradients,
             'mid_inside_sphere': ret_fine['mid_inside_sphere'],
+            'surface_points': ret_fine['surface_points'],
         }
 
     def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0, save_numpy_sdf=False, case = None):

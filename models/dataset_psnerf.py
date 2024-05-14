@@ -46,9 +46,8 @@ class Dataset:
         self.normal_dir = conf.get_string('normal_dir')
         self.normal_mask_dir = conf.get_string('normal_mask_dir')
         self.render_cameras_name = conf.get_string('camera_params')
-        self.image_num = conf.get_string('image_num')
-        self.image_num = "00" + self.image_num if len(self.image_num) == 1 else "0" + self.image_num
-        self.n_views = conf.get_int('n_views')
+        self.n_views = conf.get_string('n_views')
+        self.select_views = conf.get_string('select_views', default='')
 
         if(self.data_dir.split('/')[-1] in ['armadillo', 'bunny']):
             self.images_list = sorted(glob(os.path.join(self.image_dir, 'avg_l96', '*.png')))
@@ -68,24 +67,36 @@ class Dataset:
         self.normals_list = sorted(glob(os.path.join(self.normal_dir, '*.npy')))
         self.normal_masks_list = sorted(glob(os.path.join(self.normal_mask_dir, '*.png')))
 
+        if self.n_views != 'all':
+            # self.select_views = [int(x) - 1 for x in self.select_views.split()]
 
-        # select n_views from the list of images by dividing the total number of images by n_views
-        n_selected_images = len(self.images_list) // self.n_views
+            # self.images_list = [self.images_list[i] for i in self.select_views]
+            # self.masks_lis = [self.masks_lis[i] for i in self.select_views]
+            # self.normals_list = [self.normals_list[i] for i in self.select_views]
+            # self.normal_masks_list = [self.normal_masks_list[i] for i in self.select_views]
 
-        self.images_list = self.images_list[::n_selected_images]
-        self.masks_lis = self.masks_lis[::n_selected_images]
-        self.normals_list = self.normals_list[::n_selected_images]
-        self.normal_masks_list = self.normal_masks_list[::n_selected_images]
+            # select n_views from the list of images by dividing the total number of images by n_views
+            n_selected_images = len(self.images_list) // self.n_views
+
+            if(n_selected_images > 1):
+                self.images_list = self.images_list[::n_selected_images]
+                self.masks_lis = self.masks_lis[::n_selected_images]
+                self.normals_list = self.normals_list[::n_selected_images]
+                self.normal_masks_list = self.normal_masks_list[::n_selected_images]
+            else:
+                self.images_list = self.images_list[:self.n_views]
+                self.masks_lis = self.masks_lis[:self.n_views]
+                self.normals_list = self.normals_list[:self.n_views]
+                self.normal_masks_list = self.normal_masks_list[:self.n_views]
 
         self.n_images = len(self.images_list)
+
+        print('Number of images: ', self.n_images)
 
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_list]) / 255.0
         self.normal_vecs = np.stack([np.load(normal_file) for normal_file in self.normals_list])
         self.normal_masks_imgs = np.stack([cv.imread(im_name) for im_name in self.normal_masks_list]) / 255.0
         self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 255.0
-
-        self.intrinsics_all = []
-        self.pose_all = []
 
         with open(os.path.join(self.data_dir, self.render_cameras_name)) as file:
             camera_calib_dict = json.load(file)
@@ -100,7 +111,16 @@ class Dataset:
 
         self.intrinsics_all = np.tile(intrinsics, (self.n_images, 1)).reshape(self.n_images, intrinsics.shape[0], intrinsics.shape[1])
 
-        self.pose_all = np.asarray(camera_calib_dict['pose_c2w']).astype(np.float32)[::n_selected_images]
+        if(self.n_views != 'all'):
+            # self.pose_all = np.asarray(camera_calib_dict['pose_c2w']).astype(np.float32)[self.select_views]
+            
+            if(n_selected_images > 1):
+                self.pose_all = np.asarray(camera_calib_dict['pose_c2w']).astype(np.float32)[::n_selected_images]
+            else:
+                self.pose_all = np.asarray(camera_calib_dict['pose_c2w']).astype(np.float32)[:self.n_views]
+        else:
+            self.pose_all = np.asarray(camera_calib_dict['pose_c2w']).astype(np.float32)
+        
 
         if(not self.gt_normal_world):
             self.normal_vecs = np.einsum('bij,bklj->bkli', self.pose_all[:, :3, :3], self.normal_vecs)
@@ -150,7 +170,7 @@ class Dataset:
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
         rays_o = self.pose_all[img_idx, None, None, :3, 3].expand(rays_v.shape)  # W, H, 3
-        return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
+        return rays_o.transpose(0, 1), rays_v.transpose(0, 1), self.pose_all[img_idx], self.intrinsics_all[img_idx]
     
     def gen_rays_at_psnerf(self, img_idx, resolution_level=1):
         """
@@ -169,7 +189,7 @@ class Dataset:
         rays_v = torch.matmul(self.pose_all[img_idx, None, None, :3, :3], p_trans[:, :, :, None]).squeeze()  # W, H, 3
         rays_o = self.pose_all[img_idx, None, None, :3, 3].expand(rays_v.shape)  # W, H, 3
 
-        return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
+        return rays_o.transpose(0, 1), rays_v.transpose(0, 1), self.pose_all[img_idx], self.intrinsics_all[img_idx]
     
     def gen_random_rays_at(self, img_idx, batch_size):
         """
@@ -213,7 +233,7 @@ class Dataset:
         rays_v = rays_v / torch.linalg.norm(rays_v, ord=2, dim=-1, keepdim=True)
 
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), normal.cpu(), mask[:, :1].cpu(), normal_mask[:, :1].cpu()], dim=-1).cuda()    # batch_size, 10
+        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), normal.cpu(), mask[:, :1].cpu(), normal_mask[:, :1].cpu()], dim=-1).cuda(), self.pose_all[img_idx], self.intrinsics_all[img_idx]  # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """
@@ -259,4 +279,3 @@ class Dataset:
     def image_at(self, idx, resolution_level):
         img = cv.imread(self.images_list[idx])
         return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
-

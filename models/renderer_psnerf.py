@@ -318,7 +318,6 @@ class NeuSRenderer:
         # normalize the gradients
         gradients_surface = gradients_surface / torch.linalg.norm(gradients_surface, ord=2, dim=-1, keepdim=True)
 
-
         sdf_d = sdf.reshape(batch_size, n_samples)
         prev_sdf, next_sdf = sdf_d[:, :-1], sdf_d[:, 1:]
         sign = prev_sdf * next_sdf
@@ -340,15 +339,14 @@ class NeuSRenderer:
         max_z_val = torch.max(z_vals)
         z_vals_sdf0 = torch.where(z_vals_sdf0 > max_z_val, torch.zeros_like(z_vals_sdf0), z_vals_sdf0)
         pts_sdf0 = rays_o[:, None, :] + rays_d[:, None, :] * z_vals_sdf0[..., :, None]  # [batch_size, 1, 3]
-        # gradients_sdf0 = sdf_network.gradient(pts_sdf0.reshape(-1, 3)).squeeze().reshape(batch_size, 1, 3)
-        # gradients_sdf0 = gradients_sdf0 / torch.linalg.norm(gradients_sdf0, ord=2, dim=-1, keepdim=True)
+        gradients_sdf0 = sdf_network.gradient(pts_sdf0.reshape(-1, 3)).squeeze().reshape(batch_size, 1, 3)
+        gradients_sdf0 = gradients_sdf0 / torch.linalg.norm(gradients_sdf0, ord=2, dim=-1, keepdim=True)
 
         # project_xyz = torch.matmul(poses[:3, :3].permute(1, 0), pts_sdf0.permute(0, 2, 1))
         # t = - torch.matmul(poses[:3, :3].permute(1, 0), poses[:3, 3, None])
         # project_xyz = project_xyz + t
         # project_xyz = torch.matmul(intrinsics[:3, :3], project_xyz)  # [batch_size, 3, 1]
         # depth_sdf = project_xyz[:, 2, 0] * mid_inside_sphere.squeeze(1)
-
 
         return {
             'color': color,
@@ -366,6 +364,7 @@ class NeuSRenderer:
             # 'depth_sdf': depth_sdf,
             'mid_inside_sphere': mid_inside_sphere,
             'surface_points': pts_sdf0,
+            # 'surface_points_gradients': gradients_sdf0,
             'surface_points_gradients': gradients_surface,
         }
 

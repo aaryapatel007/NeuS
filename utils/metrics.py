@@ -65,6 +65,10 @@ class LPIPS():
     def __call__(self, img1, img2, mask=None):
         # img1 = torch.from_numpy(img1).permute(2,0,1).unsqueeze(0).to(torch.float32).cuda()*2.-1
         # img2 = torch.from_numpy(img2).permute(2,0,1).unsqueeze(0).to(torch.float32).cuda()*2.-1
+        
+        # reshape H x W x 3
+        H, W = np.sqrt(img1.shape[0]).astype(int), np.sqrt(img1.shape[0]).astype(int)
+        img1, img2 = img1.reshape(H, W, 3), img2.reshape(H, W, 3)
 
         img1 = img1.permute(2, 0, 1).unsqueeze(0) * 2.0 - 1.0
         img2 = img2.permute(2, 0, 1).unsqueeze(0) * 2.0 - 1.0

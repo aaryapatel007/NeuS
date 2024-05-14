@@ -45,10 +45,8 @@ class Dataset:
         self.depth_dir = conf.get_string('depth_dir')
         self.render_cameras_name = conf.get_string('render_cameras_name')
         self.object_cameras_name = conf.get_string('object_cameras_name')
-
-        num_views = conf.get_string('n_views')
-        self.generator = torch.Generator(device='cuda')
-        self.generator.manual_seed(np.random.randint(1e9))
+        self.select_views = conf.get_string('select_views')
+        self.n_views = conf.get_string('n_views')
 
         self.camera_outside_sphere = conf.get_bool('camera_outside_sphere', default=True)
         self.scale_mat_scale = conf.get_float('scale_mat_scale', default=1.1)
@@ -56,24 +54,42 @@ class Dataset:
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
         self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
-        self.normals_list = sorted(glob(os.path.join(self.normal_dir, '*.npy')))
-        self.camera_normal_vecs = np.stack([np.load(normal_file) for normal_file in self.normals_list])
-        self.depth_list = sorted(glob(os.path.join(self.depth_dir, '*.png')))
-        self.n_images = len(self.images_lis)
-        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
-        self.depth_np = np.stack([cv.imread(im_name, cv.IMREAD_GRAYSCALE) for im_name in self.depth_list]) / 255.0
-        self.depth_np = np.expand_dims(self.depth_np, axis=-1)
-        self.images_gray_np = np.stack([cv.imread(im_name, cv.IMREAD_GRAYSCALE) for im_name in self.images_lis]) / 255.0  # Read grayscale images
         self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
-        self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
+        self.normals_list = sorted(glob(os.path.join(self.normal_dir, '*.npy')))
+        self.depths_list = sorted(glob(os.path.join(self.data_dir, 'depth/*.png')))
 
-        # world_mat is a projection matrix from world to image
-        self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+        self.n_images = len(self.images_lis)
 
-        self.scale_mats_np = []
+        # only load select views
+        if self.n_views != 'all':
+            self.select_views = [int(x) for x in self.select_views.split()]
 
-        # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
-        self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+            self.images_lis = [self.images_lis[i] for i in self.select_views]
+            self.masks_lis = [self.masks_lis[i] for i in self.select_views]
+            self.normals_list = [self.normals_list[i] for i in self.select_views]
+            self.depths_list = [self.depths_list[i] for i in self.select_views]
+
+            self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in self.select_views]
+            self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in self.select_views]
+        else:
+            # world_mat is a projection matrix from world to image
+            self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+
+            # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
+            self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+
+        print('Number of examples: %d' % len(self.images_lis))
+        self.n_images = len(self.images_lis)
+
+        self.camera_normal_vecs = np.stack([np.load(normal_file).squeeze() for normal_file in self.normals_list])
+        
+        # TODO: check if this is correct
+        self.camera_normal_vecs =  np.moveaxis(self.camera_normal_vecs, 1, 3)
+        
+        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 255.0
+        self.depths_np = np.stack([cv.imread(im_name, cv.IMREAD_GRAYSCALE) for im_name in self.depths_list]) / 255.0
+        self.depth_np = np.expand_dims(self.depths_np, axis=-1)
+        self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 255.0
 
         self.intrinsics_all = np.zeros((self.n_images, 4, 4), dtype=np.float32)
         self.pose_all = np.zeros((self.n_images, 4, 4), dtype=np.float32)
@@ -92,22 +108,16 @@ class Dataset:
         # normalize normal vectors
         self.normal_vecs = self.normal_vecs / (np.linalg.norm(self.normal_vecs, axis=-1, keepdims=True) + 1e-8)
 
-        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cuda()  # [n_images, H, W, 3]
-        self.images_gray = torch.from_numpy(self.images_gray_np.astype(np.float32)).cuda()
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cuda()   # [n_images, H, W, 3]
+        self.images = torch.from_numpy(self.images_np.astype(np.float32)).to(self.device)  # [n_images, H, W, 3]
+        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).to(self.device)   # [n_images, H, W, 3]
+        self.depths = torch.from_numpy(self.depths_np.astype(np.float32)).unsqueeze(-1).to(self.device)  # [n_images, H, W]
         self.normals = torch.from_numpy(self.normal_vecs.astype(np.float32)).to(self.device)  # [n_images, H, W, 3]
-        self.depths = torch.from_numpy(self.depth_np.astype(np.float32)).to(self.device)  # [n_images, H, W]
         self.intrinsics_all = torch.from_numpy(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
         self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
         self.focal = self.intrinsics_all[0][0, 0]
         self.pose_all = torch.from_numpy(self.pose_all).to(self.device)  # [n_images, 4, 4]
         self.H, self.W = self.images.shape[1], self.images.shape[2]
         self.image_pixels = self.H * self.W
-
-        pts_dir = os.path.join(self.data_dir, 'sfm_pts/points.npy')
-        view_id_dir = os.path.join(self.data_dir, 'sfm_pts/view_id.npy')
-        self.pts = torch.from_numpy(np.load(pts_dir)).cuda()
-        self.pts_view_id = np.load(view_id_dir, allow_pickle=True)
 
         object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
         object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
@@ -118,75 +128,88 @@ class Dataset:
         self.object_bbox_min = object_bbox_min[:3, 0]
         self.object_bbox_max = object_bbox_max[:3, 0]
 
-        if num_views == 'max':
-            self.num_views = self.n_images - 1
-        else:
-            self.num_views = int(num_views) - 1
-        with open(os.path.join(self.data_dir, "pairs.txt")) as f:
-            pairs = f.readlines()
-
-        self.src_idx = []
-        for p in pairs:
-            splitted = p.split()[1:]  # drop the first one since it is the ref img
-            fun = lambda s: int(s.split(".")[0])
-            self.src_idx.append(torch.tensor(list(map(fun, splitted))))
-
         print('Load data: End')
 
     def gen_rays_at(self, img_idx, resolution_level=1):
         """
         Generate rays at world space from one camera.
         """
-
-        src_idx = self.src_idx[img_idx]
-        src_idx = src_idx[:9]
-        # src_idx = src_idx[-9:]
-        idx_list = torch.cat([torch.tensor(img_idx).unsqueeze(0), src_idx], dim=0)
-
-        poses_pair = self.pose_all[idx_list]  # [store R^-1 and C]
-        intrinsics_pair = self.intrinsics_all[idx_list]
-        intrinsics_inv_pair = self.intrinsics_all_inv[idx_list]
-        images_gray_pair = self.images_gray[idx_list]
-
         l = resolution_level
         tx = torch.linspace(0, self.W - 1, self.W // l)
         ty = torch.linspace(0, self.H - 1, self.H // l)
         pixels_x, pixels_y = torch.meshgrid(tx, ty)
-
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1) # W, H, 3
         p = torch.matmul(self.intrinsics_all_inv[img_idx, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
         rays_o = self.pose_all[img_idx, None, None, :3, 3].expand(rays_v.shape)  # W, H, 3
-        return rays_o.transpose(0, 1), rays_v.transpose(0, 1), intrinsics_pair, intrinsics_inv_pair, poses_pair, images_gray_pair
+        return rays_o.transpose(0, 1), rays_v.transpose(0, 1), self.pose_all[img_idx], self.intrinsics_all[img_idx]
+    
+    def gen_rays_at_psnerf(self, img_idx, resolution_level=1):
+        """
+        Generate rays at world space from one camera.
+        """
+        l = resolution_level
+        tx = torch.linspace(0, self.W - 1, self.W // l)
+        ty = torch.linspace(0, self.H - 1, self.H // l)
+        pixels_x, pixels_y = torch.meshgrid(tx, ty)
+        # p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1) # W, H, 3
+        p = torch.stack([pixels_x, pixels_y], dim=-1) # W, H, 2
+        p_trans = (p - self.intrinsics_all[img_idx,:2,2]) / self.intrinsics_all[img_idx,0,0]
+        p_trans = torch.cat([p_trans, torch.ones_like(p_trans[...,:1])], dim=-1) 
+        p_trans = p_trans / torch.linalg.norm(p_trans, ord=2, dim=-1, keepdim=True)
+        # rays_v = torch.einsum('bij,bnj->bni',self.pose_all[img_idx, None, None, :3, :3], p_trans).squeeze(0)
+        rays_v = torch.matmul(self.pose_all[img_idx, None, None, :3, :3], p_trans[:, :, :, None]).squeeze()  # W, H, 3
+        rays_o = self.pose_all[img_idx, None, None, :3, 3].expand(rays_v.shape)  # W, H, 3
 
+        return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
+    
     def gen_random_rays_at(self, img_idx, batch_size):
         """
         Generate random rays at world space from one camera.
         """
-
-        src_idx = self.src_idx[img_idx]
-        src_idx = src_idx[:9]
-        # src_idx = src_idx[-9:]
-        idx_list = torch.cat([img_idx.clone().detach().unsqueeze(0), src_idx], dim=0).cuda()
-
-        poses_pair = self.pose_all[idx_list]  # [store R^-1 and C]
-        intrinsics_pair = self.intrinsics_all[idx_list]
-        intrinsics_inv_pair = self.intrinsics_all_inv[idx_list]
-        images_gray_pair = self.images_gray[idx_list]
-
-        pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
-        pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
+        pixels_x = torch.randint(low=0, high=self.W, size=[batch_size], device = self.device)
+        pixels_y = torch.randint(low=0, high=self.H, size=[batch_size], device = self.device)
         color = self.images[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
         mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 3
         normal = self.normals[img_idx][(pixels_y, pixels_x)]
         depth = self.depths[img_idx][(pixels_y, pixels_x)]
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
+        # pixel to camera coordinate transformation
         p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze() # batch_size, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), normal.cpu(), depth.cpu(), mask[:, :1].cpu()], dim=-1).cuda(), intrinsics_pair, intrinsics_inv_pair, poses_pair, images_gray_pair    # batch_size, 10
+        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), normal.cpu(), depth.cpu(), mask[:, :1].cpu()], dim=-1).cuda(), self.pose_all[img_idx], self.intrinsics_all[img_idx]    # batch_size, 10
+    
+    def gen_random_rays_at_psnerf(self, img_idx, batch_size):
+        """
+        Generate random rays at world space from one camera.
+        """
+        pixels_x = torch.randint(low=0, high=self.W, size=[batch_size], device = self.device)
+        pixels_y = torch.randint(low=0, high=self.H, size=[batch_size], device = self.device)
+
+        color = self.images[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
+        mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 3
+        normal = self.normals[img_idx][(pixels_y, pixels_x)]  # batch_size, 3
+        # normal_mask = self.normal_masks[img_idx][(pixels_y, pixels_x)]  # batch_size, 3
+        
+        # p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
+        # # pixel to camera coordinate transformation
+        # p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze() # batch_size, 3
+        # rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
+
+        # # camera to world coordinate transformation
+        # rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
+
+        p = torch.stack([pixels_x, pixels_y], dim=-1) # W, H, 2
+        p_trans = (p - self.intrinsics_all[img_idx,:2,2]) / self.intrinsics_all[img_idx,0,0]
+        p_trans = torch.cat([p_trans, torch.ones_like(p_trans[...,:1])], dim=-1) 
+        rays_v = torch.einsum('bij,bnj->bni',self.pose_all[img_idx, None, :3, :3], p_trans.unsqueeze(0)).squeeze(0)
+        rays_v = rays_v / torch.linalg.norm(rays_v, ord=2, dim=-1, keepdim=True)
+
+        rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
+        return torch.cat([rays_o.cpu(), rays_v.cpu(), color.cpu(), normal.cpu(), mask[:, :1].cpu()], dim=-1).cuda()    # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """
@@ -232,8 +255,3 @@ class Dataset:
     def image_at(self, idx, resolution_level):
         img = cv.imread(self.images_lis[idx])
         return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
-
-    def gen_pts_view(self, img_idx):
-        pts_view_id = self.pts_view_id[img_idx]
-        pts_view = self.pts[pts_view_id]
-        return pts_view

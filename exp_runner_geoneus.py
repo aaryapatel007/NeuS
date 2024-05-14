@@ -12,7 +12,7 @@ from tqdm import tqdm
 from pyhocon import ConfigFactory
 from models.dataset_geoneus import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
-from models.renderer_geoneus import GeoNeuSRenderer, get_psnr
+from models.renderer_diligent import NeuSRenderer
 # from plyfile import PlyData, PlyElement
 from models import mesh_filtering
 from skimage import morphology as morph
@@ -60,9 +60,10 @@ class Runner:
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight')
-        self.alignment_weight = self.conf.get_float('train.align_weight')
-        self.depth_weight = self.conf.get_float('train.depth_weight')
         self.normal_weight = self.conf.get_float('train.normal_weight')
+        self.depth_weight = self.conf.get_float('train.depth_weight')
+        self.sparse_weight = self.conf.get_float('train.sparse_weight')
+        self.bias_weight = self.conf.get_float('train.bias_weight')
         self.is_continue = is_continue
         self.mode = mode
         self.model_list = []
@@ -80,7 +81,7 @@ class Runner:
         params_to_train += list(self.color_network.parameters())
         self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
 
-        self.renderer = GeoNeuSRenderer(self.nerf_outside,
+        self.renderer = NeuSRenderer(self.nerf_outside,
                                      self.sdf_network,
                                      self.deviation_network,
                                      self.color_network,
@@ -95,7 +96,7 @@ class Runner:
                  if model_name[-3:] == 'pth' and int(model_name[5:-4]) <= self.end_iter:
                      model_list.append(model_name)
              model_list.sort()
-             latest_model_name = model_list[checkpoint-1]
+             latest_model_name = model_list[-1]
 
         if is_continue:
             model_list_raw = os.listdir(os.path.join(self.base_exp_dir, 'checkpoints'))
@@ -111,8 +112,8 @@ class Runner:
             self.load_checkpoint(latest_model_name)
 
         # Backup codes and configs for debug
-        if self.mode[:5] == 'train':
-            self.file_backup()
+        # if self.mode[:5] == 'train':
+        #     self.file_backup()
 
     def train(self):
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
@@ -123,7 +124,7 @@ class Runner:
         for iter_i in tqdm(range(res_step)):
             torch.cuda.manual_seed(iter_i)
             torch.manual_seed(iter_i)
-            data, intrinsic, intrinsic_inv, pose, image_gray = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
+            data, pose_c2w, intrinsics = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
             rays_o, rays_d, true_rgb, true_normal, true_depth, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9 : 12], data[:, 12 : 13], data[:, 13 : 14],
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
@@ -139,64 +140,76 @@ class Runner:
 
             mask_sum = mask.sum() + 1e-5
             render_out = self.renderer.render(rays_o, rays_d, near, far,
-                                              background_rgb=background_rgb,
-                                              cos_anneal_ratio=self.get_cos_anneal_ratio(), intrinsics=intrinsic, intrinsics_inv=intrinsic_inv, poses=pose, images=image_gray)
-
-            img_idx_d = self.iter_step % len(image_perm)
-
-
-            pts_view = self.dataset.gen_pts_view(img_idx_d)
-            pts2sdf = self.renderer.sdf_network.sdf(pts_view)
+                                            background_rgb=background_rgb,
+                                            cos_anneal_ratio=self.get_cos_anneal_ratio())
 
             color_fine = render_out['color_fine']
             s_val = render_out['s_val']
             cdf_fine = render_out['cdf_fine']
             gradient_error = render_out['gradient_error']
-            alignment_error = render_out['alignment_error']
-            surface_points_normal = render_out['surface_points_gradients']
+            sparse_loss = render_out['sparse_loss']
+            bias_loss = render_out['bias_loss']
             weight_max = render_out['weight_max']
             weight_sum = render_out['weight_sum']
-            ncc_cost = render_out['ncc_cost']
-            inside_sphere = render_out['mid_inside_sphere']
-            depth_sdf = render_out['depth_sdf']
+            surface_points_normal = render_out['surface_points_gradients']
+            # surface_points = render_out['surface_points']
+            # mid_inside_sphere = render_out['mid_inside_sphere']
 
-            depth_sdf[depth_sdf < 0] = 0
-            depth_sdf /= depth_sdf.max()
+            # # world surface points to pixel surface points
+            # surface_points_camera = torch.matmul(pose_c2w[:3, :3].permute(1, 0), surface_points.permute(0, 2, 1))
+            # trans = - torch.matmul(pose_c2w[:3, :3].permute(1, 0), pose_c2w[:3, 3, None])
+            # surface_points_camera = surface_points_camera + trans
+
+            # surface_points_pixels = torch.matmul(intrinsics[:3, :3], surface_points_camera)
+            # estim_depth = surface_points_pixels[:, 2, :] * mid_inside_sphere
+
+            # # normalize depth (min-max normalization)
+            # estim_depth = (estim_depth - estim_depth.min()) / (estim_depth.max() - estim_depth.min())
+
+            # # depth loss
+            # depth_error = (estim_depth - true_depth) * mask
+
+            # if(depth_error.shape[0] > 0):
+            #     depth_loss = F.l1_loss(depth_error, torch.zeros_like(depth_error), reduction='sum') / mask_sum
+            # else:
+            #     depth_loss = 0.0
 
             # Loss
             color_error = (color_fine - true_rgb) * mask
             color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
-
-            depth_error = (depth_sdf - true_depth) * mask
-            depth_loss = F.l1_loss(depth_error, torch.zeros_like(depth_error), reduction='sum') / mask_sum
-
             psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
 
             eikonal_loss = gradient_error
-            gradient_cosistency_loss = alignment_error
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask.float())
 
             normal_error = (surface_points_normal - true_normal) * mask
-
-            sdf_loss = F.l1_loss(pts2sdf, torch.zeros_like(pts2sdf),
-                                   reduction='sum') / pts2sdf.shape[0]
-
-            ncc_loss = 0.5 * (ncc_cost.sum(dim=0) / (inside_sphere.sum(dim=0) + 1e-8)).squeeze(-1)
 
             if(normal_error.shape[0] > 0):
                 normal_loss = F.l1_loss(normal_error, torch.zeros_like(normal_error))
             else:
                 normal_loss = 0.0
 
+            # if(depth_error.shape[0] > 0):
+            #     depth_loss = F.l1_loss(depth_error, torch.zeros_like(depth_error), reduction='sum') / mask_sum
+            # else:
+            #     depth_loss = 0.0
+                
+            # loss = color_fine_loss +\
+            #        eikonal_loss * self.igr_weight +\
+            #        mask_loss * self.mask_weight +\
+            #        gradient_cosistency_loss * self.alignment_weight +\
+            #        normal_loss * self.normal_weight +\
+            #        depth_loss * self.depth_weight +\
+            #        sdf_loss +\
+            #        ncc_loss
+
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
+                   sparse_loss * self.sparse_weight +\
+                     bias_loss * self.bias_weight +\
                    mask_loss * self.mask_weight +\
-                   gradient_cosistency_loss * self.alignment_weight +\
-                   normal_loss * self.normal_weight +\
-                   depth_loss * self.depth_weight +\
-                   sdf_loss +\
-                   ncc_loss
+                   normal_loss * self.normal_weight
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -206,12 +219,12 @@ class Runner:
 
             self.writer.add_scalar('Loss/loss', loss, self.iter_step)
             self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
-            self.writer.add_scalar('Loss/depth_loss', depth_loss, self.iter_step)
+            # self.writer.add_scalar('Loss/depth_loss', depth_loss, self.iter_step)
             self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
-            self.writer.add_scalar('Loss/sdf_loss', sdf_loss, self.iter_step)
-            self.writer.add_scalar('Loss/ncc_loss', ncc_loss, self.iter_step)
-            self.writer.add_scalar('Loss/gradient_cosistency_loss', gradient_cosistency_loss, self.iter_step)
+            self.writer.add_scalar('Loss/sparse_loss', sparse_loss, self.iter_step)
+            self.writer.add_scalar('Loss/bias_loss', bias_loss, self.iter_step)
             self.writer.add_scalar('Loss/normal_loss', normal_loss, self.iter_step)
+            self.writer.add_scalar('Loss/mask_loss', mask_loss, self.iter_step)
             self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
             self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
             self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
@@ -219,9 +232,7 @@ class Runner:
 
             if self.iter_step % self.report_freq == 0:
                 print(self.base_exp_dir)
-                print('iter:{:8>d} loss = {} color_loss={} depth_loss = {} normal_loss = {} eikonal_loss={} sdf_loss={} ncc_loss={} psnr={} lr={}'.format(
-                    self.iter_step, loss, color_fine_loss, depth_loss, normal_loss, eikonal_loss,
-                    sdf_loss, ncc_loss, psnr, self.optimizer.param_groups[0]['lr']))
+                print('iter:{:8>d} loss = {} color_loss = {} normal_loss = {} sparse_loss = {} bias_loss = {} eikonal_loss = {} mask_loss = {} lr = {} PSNR = {}'.format(self.iter_step, loss, color_fine_loss, normal_loss, sparse_loss, bias_loss, eikonal_loss, mask_loss, self.optimizer.param_groups[0]['lr'], psnr))
 
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
@@ -230,8 +241,8 @@ class Runner:
                 np.random.seed(iter_i)  # seed
                 self.validate_image()
 
-            # if self.iter_step % self.val_mesh_freq == 0:
-            #     self.validate_mesh()
+            if self.iter_step % self.val_mesh_freq == 0:
+                self.validate_mesh_ori()
 
             self.update_learning_rate()
 
@@ -303,7 +314,7 @@ class Runner:
 
         if resolution_level < 0:
             resolution_level = self.validate_resolution_level
-        rays_o, rays_d, intrinsic, intrinsic_inv, pose, image_gray = self.dataset.gen_rays_at(idx, resolution_level=resolution_level)
+        rays_o, rays_d, pose_c2w, intrinsics = self.dataset.gen_rays_at(idx, resolution_level=resolution_level)
         H, W, _ = rays_o.shape
         rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
         rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
@@ -322,7 +333,7 @@ class Runner:
                                               near,
                                               far,
                                               cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                              background_rgb=background_rgb, intrinsics=intrinsic, intrinsics_inv=intrinsic_inv, poses=pose, images=image_gray)
+                                              background_rgb=background_rgb)
 
             def feasible(key): return (key in render_out) and (render_out[key] is not None)
 
@@ -335,10 +346,18 @@ class Runner:
                     normals = normals * render_out['inside_sphere'][..., None]
                 normals = normals.sum(dim=1).detach().cpu().numpy()
                 out_normal_fine.append(normals)
-            if feasible('depth_sdf'):
-                out_depth_fine.append(render_out['depth_sdf'].detach().cpu().numpy())
-            if feasible('ncc_cost'):
-                out_ncc_fine.append(render_out['ncc_cost'].detach().cpu().numpy())
+            if feasible('surface_points') and feasible('mid_inside_sphere'):
+                surface_points = render_out['surface_points']
+                mid_inside_sphere = render_out['mid_inside_sphere']
+
+                surface_points_camera = torch.matmul(pose_c2w[:3, :3].permute(1, 0), surface_points.permute(0, 2, 1))
+                trans = - torch.matmul(pose_c2w[:3, :3].permute(1, 0), pose_c2w[:3, 3, None])
+                surface_points_camera = surface_points_camera + trans
+
+                surface_points_pixels = torch.matmul(intrinsics[:3, :3], surface_points_camera)
+                estim_depth = surface_points_pixels[:, 2, :] * mid_inside_sphere
+                out_depth_fine.append(estim_depth.detach().cpu().numpy())
+
             del render_out
 
         img_fine = None
@@ -349,10 +368,10 @@ class Runner:
         if len(out_depth_fine) > 0:
             depth_fine = np.concatenate(out_depth_fine, axis=0).reshape([H, W, 1, -1])
             depth_fine[depth_fine < 0] = 0
-
-        ncc_cost = None
-        if len(out_ncc_fine) > 0:
-            ncc_cost = np.concatenate(out_ncc_fine, axis=0).reshape([H, W, 1, -1])
+            
+        # ncc_cost = None
+        # if len(out_ncc_fine) > 0:
+        #     ncc_cost = np.concatenate(out_ncc_fine, axis=0).reshape([H, W, 1, -1])
 
         normal_img = None
         if len(out_normal_fine) > 0:
@@ -364,8 +383,7 @@ class Runner:
 
         os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
         os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
-        os.makedirs(os.path.join(self.base_exp_dir, 'depths'), exist_ok=True)
-        os.makedirs(os.path.join(self.base_exp_dir, 'ncc_costs'), exist_ok=True)
+        os.makedirs(os.path.join(self.base_exp_dir, 'depths_estim'), exist_ok=True)
 
         for i in range(img_fine.shape[-1]):
             if len(out_rgb_fine) > 0:
@@ -379,75 +397,12 @@ class Runner:
                                         'normals',
                                         '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
                            normal_img[..., i])
+            
             if len(out_depth_fine) > 0:
                 cv.imwrite(os.path.join(self.base_exp_dir,
-                                        'depths',
-                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)), (255 * depth_fine[..., i] / depth_fine[..., i].max()).astype(np.uint8))
-            if len(out_ncc_fine) > 0:
-                cv.imwrite(os.path.join(self.base_exp_dir,
-                                        'ncc_costs',
-                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)), (255 * ncc_cost[..., i] / 2.0).astype(np.uint8))
-
-
-    def eval_image(self, resolution_level=1):
-        img_fine_dir = os.path.join(self.base_exp_dir, 'img_fine')
-        if not os.path.exists(img_fine_dir):
-            os.makedirs(img_fine_dir)
-        n_batch = 1200 * 1600 / self.batch_size
-        pbar = tqdm(total=self.dataset.n_images * n_batch)
-        evaldir = Path("evals/{}".format(self.case))
-        scan = self.case.split('/')[-1]
-        psnrs = []
-        for i in range(self.dataset.n_images):
-            img_fine_file = os.path.join(img_fine_dir, '{}.png'.format(i))
-            if(os.path.exists(img_fine_file)):
-                img_fine = torch.from_numpy(cv.imread(img_fine_file)).cuda() / 256.0
-            else:
-                rays_o, rays_d, intrinsic, intrinsic_inv, pose, image_gray = self.dataset.gen_rays_at(i, resolution_level=resolution_level)
-                H, W, _ = rays_o.shape
-                rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
-                rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
-                out_rgb_fine = []
-                for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
-                    torch.cuda.empty_cache()
-                    near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
-                    background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
-
-                    with torch.no_grad():
-                        render_out = self.renderer.render(rays_o_batch,
-                                                          rays_d_batch,
-                                                          near,
-                                                          far,
-                                                          cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                                          background_rgb=background_rgb, intrinsics=intrinsic,
-                                                          intrinsics_inv=intrinsic_inv, poses=pose, images=image_gray)
-
-                    out_rgb_fine.append(render_out['color_fine'].detach().cpu().numpy())
-                    del render_out
-                    pbar.update(1)
-                    pbar.set_description('image %d' % i)
-
-                img_fine = torch.from_numpy(
-                    (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255) / 256).cuda()
-                # img_fine = torch.from_numpy(np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3])).cuda()
-                img_fine2 = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255)
-
-                cv.imwrite(img_fine_file, img_fine2)
-
-            gt_img = torch.from_numpy(self.dataset.image_at(i, resolution_level=resolution_level)).cuda() / 256.0
-            # gt_img = np.transpose(gt_img, (0, 1))
-
-            psnr = get_psnr(img_fine.reshape(-1, 3), gt_img.reshape(-1, 3)).item()
-            print("\npsnr: ", psnr)
-            psnrs.append(psnr)
-
-        pbar.close()
-        psnrs = np.array(psnrs).astype(np.float64)
-        print("RENDERING EVALUATION {2}: psnr mean = {0} ; psnr std = {1}".format("%.2f" % psnrs.mean(),
-                                                                                  "%.2f" % psnrs.std(), scan))
-        psnrs = np.concatenate([psnrs, psnrs.mean()[None], psnrs.std()[None]])
-        pd.DataFrame(psnrs).to_csv('{}/psnr.csv'.format(evaldir))
-
+                                        'depths_estim',
+                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
+                           (depth_fine[..., i] / depth_fine[..., i].max() * 255).astype(np.uint8))
 
     def render_novel_image(self, idx_0, idx_1, ratio, resolution_level):
         """
@@ -667,8 +622,8 @@ if __name__ == '__main__':
         runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold, dilation=args.dilation) # 512
     # elif args.mode == 'validate_mesh_womask':
     #     runner.validate_mesh_womask(world_space=True, resolution=512, threshold=args.mcube_threshold, dilation=args.dilation) # 512
-    # elif args.mode == 'validate_mesh_ori':
-    #     runner.validate_mesh_ori(world_space=True, resolution=512, threshold=args.mcube_threshold) # 512
+    elif args.mode == 'validate_mesh_ori':
+        runner.validate_mesh_ori(world_space=False, resolution=512, threshold=args.mcube_threshold) # 512
     elif args.mode == 'validate_image':
         runner.validate_image()
     elif args.mode == 'eval_image':
